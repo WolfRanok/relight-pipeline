@@ -5,7 +5,7 @@
 ## 安装
 
 ```powershell
-git clone <你的仓库地址>
+git clone https://github.com/WolfRanok/relight-pipeline.git
 cd relight-pipeline
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
