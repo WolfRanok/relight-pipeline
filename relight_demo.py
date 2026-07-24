@@ -220,7 +220,7 @@ def main() -> int:
         return 3
     if result.get("deferred_pending"):
         print(
-            "仍有远端任务未结束，状态已保留；"
+            "远端任务仍在运行或状态暂时无法确认，状态已安全保留；"
             f"续跑命令：{result['resume_command']}"
         )
         return 2

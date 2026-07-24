@@ -83,14 +83,23 @@ def decode_toapis_json(text: str) -> dict[str, Any]:
         # 可恢复任务ID或结果，丢弃它会造成已付费任务在本地被误判为失败。
         first = objects[0] if objects else None
         trailing = objects[1:]
-        first_is_success = isinstance(first, dict) and not first.get("error") and any(
-            key in first for key in ("id", "status", "success", "data", "result")
+        first_is_task = (
+            isinstance(first, dict)
+            and bool(first.get("id"))
+            and first.get("status") in {"pending", "processing", "completed", "failed"}
+        )
+        first_is_success = (
+            isinstance(first, dict)
+            and not first.get("error")
+            and any(key in first for key in ("id", "success", "data", "result"))
         )
         trailing_are_errors = bool(trailing) and all(
             isinstance(value, dict) and bool(value.get("error"))
             for value in trailing
         )
-        if first_is_success and trailing_are_errors:
+        # failed任务本身会携带error字段，但其id/status仍是权威终态，必须
+        # 交给轮询逻辑记录真实失败原因，不能误报为“远端尚未结束”。
+        if (first_is_task or first_is_success) and trailing_are_errors:
             return first
         raise original_error
 

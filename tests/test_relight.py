@@ -280,6 +280,18 @@ def test_toapis_decoder_accepts_success_followed_by_gateway_panic() -> None:
     decoded = decode_toapis_json(json.dumps(task) + json.dumps(panic))
     assert decoded == task
 
+    failed_task = {
+        "id": "task-failed",
+        "status": "failed",
+        "error": {
+            "code": "generation_failed",
+            "message": "blocked by safety review",
+        },
+    }
+    assert decode_toapis_json(
+        json.dumps(failed_task) + json.dumps(panic)
+    ) == failed_task
+
     with pytest.raises(json.JSONDecodeError):
         decode_toapis_json('{"id":"truncated"')
 
