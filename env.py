@@ -127,7 +127,7 @@ RELIGHT_PROMPT_VERSION = "relight-natural-visible-v1"
 
 # 默认关闭。开启后源图按SHA-256缓存至私有OSS并提供短期签名URL；成功的
 # original、relight和提示词JSON同步到OSS，同时仍完整保留本地output结果。
-RELIGHT_OSS_ENABLED = False
+RELIGHT_OSS_ENABLED = True
 
 # None表示采用配置.md中的建议并发数；填写正整数可在不改配置文档的情况下限速。
 RELIGHT_OSS_CONCURRENCY_OVERRIDE: int | None = None
