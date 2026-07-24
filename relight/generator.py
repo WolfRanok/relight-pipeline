@@ -59,6 +59,46 @@ def _error_text(payload: dict[str, Any]) -> tuple[str | None, str]:
     return str(code) if code else None, str(message)
 
 
+def decode_toapis_json(text: str) -> dict[str, Any]:
+    """解析ToAPIs JSON，并兼容网关把panic错误拼接在成功对象后的异常响应。"""
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as original_error:
+        decoder = json.JSONDecoder()
+        position = 0
+        objects: list[Any] = []
+        try:
+            while position < len(text):
+                while position < len(text) and text[position].isspace():
+                    position += 1
+                if position >= len(text):
+                    break
+                value, position = decoder.raw_decode(text, position)
+                objects.append(value)
+        except json.JSONDecodeError:
+            raise original_error
+
+        # new-api偶尔会输出“完整成功对象 + panic错误对象”。成功对象已经包含
+        # 可恢复任务ID或结果，丢弃它会造成已付费任务在本地被误判为失败。
+        first = objects[0] if objects else None
+        trailing = objects[1:]
+        first_is_success = isinstance(first, dict) and not first.get("error") and any(
+            key in first for key in ("id", "status", "success", "data", "result")
+        )
+        trailing_are_errors = bool(trailing) and all(
+            isinstance(value, dict) and bool(value.get("error"))
+            for value in trailing
+        )
+        if first_is_success and trailing_are_errors:
+            return first
+        raise original_error
+
+    if not isinstance(payload, dict):
+        raise ValueError("ToAPIs响应顶层不是对象")
+    return payload
+
+
 def classify_toapis_error(
     status: int, payload: dict[str, Any]
 ) -> RelightGenerationError:
@@ -259,18 +299,35 @@ class RelightGenerationClient:
     async def _json(self, response: aiohttp.ClientResponse) -> dict[str, Any]:
         text = await response.text()
         try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
+            payload = decode_toapis_json(text)
+        except (json.JSONDecodeError, ValueError) as exc:
             raise RelightGenerationError(
                 f"ToAPIs HTTP {response.status}返回非JSON响应",
                 category="invalid_response",
-                retryable=response.status >= 500,
+                # 2xx却无法解析通常是网关截断、拼接或代理异常，不能把可能
+                # 已经创建的付费任务直接判为永久失败。
+                retryable=response.status < 400 or response.status >= 500,
                 http_status=response.status,
             ) from exc
-        if not isinstance(payload, dict):
-            raise RelightGenerationError("ToAPIs响应顶层不是对象")
         if response.status >= 400:
             raise classify_toapis_error(response.status, payload)
+        if payload.get("error"):
+            code, message = _error_text(payload)
+            normalized = f"{code or ''} {message}".casefold()
+            if not any(
+                marker in normalized
+                for marker in ("new_api_panic", "panic detected", "nil pointer")
+            ):
+                # 即使网关错误地返回HTTP 200，鉴权、余额、模型渠道及普通
+                # 请求拒绝仍沿用统一分类，避免把永久错误无限留给续跑。
+                raise classify_toapis_error(response.status, payload)
+            raise RelightGenerationError(
+                f"ToAPIs HTTP {response.status}: {message}",
+                category="invalid_response",
+                retryable=True,
+                http_status=response.status,
+                error_code=code,
+            )
         return payload
 
     async def upload_image(self, path: Path) -> str:

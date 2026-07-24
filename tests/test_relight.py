@@ -29,6 +29,7 @@ from relight.generator import (
     RelightTaskPendingTimeout,
     build_generation_payload,
     classify_toapis_error,
+    decode_toapis_json,
     generation_request_profile,
     save_generated_bytes,
 )
@@ -260,6 +261,27 @@ def test_generation_payload_uses_model_specific_schema() -> None:
 
     with pytest.raises(RelightGenerationError, match="尚未适配"):
         generation_request_profile("unknown-image-model")
+
+
+def test_toapis_decoder_accepts_success_followed_by_gateway_panic() -> None:
+    """new-api拼接panic对象时仍保留前面的完整付费任务状态。"""
+
+    task = {
+        "id": "task-existing",
+        "status": "completed",
+        "result": {"data": [{"url": "https://result.invalid/image"}]},
+    }
+    panic = {
+        "error": {
+            "type": "new_api_panic",
+            "message": "invalid memory address or nil pointer dereference",
+        }
+    }
+    decoded = decode_toapis_json(json.dumps(task) + json.dumps(panic))
+    assert decoded == task
+
+    with pytest.raises(json.JSONDecodeError):
+        decode_toapis_json('{"id":"truncated"')
 
 
 def test_relight_model_choice_is_loaded_from_standalone_env(monkeypatch) -> None:
@@ -517,6 +539,38 @@ def test_legacy_state_database_adds_metadata_and_event_schema(tmp_path: Path) ->
         "oss_input_key", "oss_output_prefix",
     } <= columns
     assert state.events()[0]["category"] == "test"
+    first_run_id = state.run_id()
+    assert state.run_id() == first_run_id
+    state.close()
+
+    # 删除状态库并重建相同路径代表全新运行，UUID不能与旧远端任务复用。
+    database.unlink()
+    rebuilt = RelightState(database)
+    assert rebuilt.run_id() != first_run_id
+    rebuilt.close()
+
+
+def test_legacy_invalid_json_failure_is_reopened_for_resume(tmp_path: Path) -> None:
+    """旧版本误判的HTTP 200异常响应不得永久丢失已有业务任务。"""
+
+    state = RelightState(tmp_path / "state.sqlite3")
+    state.add_items([("item-1", "a.jpg", "a.jpg")])
+    state.save_json(
+        "item-1",
+        "selection_json",
+        _decision(True).to_dict(),
+        stage="failed",
+        business_id="legacy-business-id",
+        generation_attempts=1,
+        result_json=json.dumps({"failure_stage": "image_generation"}),
+        error="RelightGenerationError: ToAPIs HTTP 200返回非JSON响应",
+    )
+    assert state.recover_invalid_response_failures() == 1
+    row = state.get("item-1")
+    assert row["stage"] == "selected"
+    assert row["generation_attempts"] == 0
+    assert row["business_id"] == "legacy-business-id"
+    assert row["result_json"] is None
     state.close()
 
 
@@ -647,6 +701,19 @@ class WaitErrorGenerationClient(FakeGenerationClient):
         return f"https://result.invalid/{identifier}"
 
 
+class QueryErrorGenerationClient(FakeGenerationClient):
+    """模拟提交前去重查询持续返回可重试的损坏响应。"""
+
+    async def query_task(self, identifier: str, allow_missing: bool = False):
+        self.query_calls.append(identifier)
+        raise RelightGenerationError(
+            "ToAPIs HTTP 200返回非JSON响应",
+            category="invalid_response",
+            retryable=True,
+            http_status=200,
+        )
+
+
 def test_permanent_generation_failure_is_not_retried(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -710,6 +777,43 @@ def test_transient_generation_failure_retries_then_succeeds(
     assert row["generation_attempts"] == 3
     assert len(generation.wait_calls) == 3
     assert len(generation.submit_calls) == 1
+
+
+def test_ambiguous_query_failure_is_deferred_instead_of_terminal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """无法确认远端状态时保留业务ID，禁止误判失败后补建付费任务。"""
+
+    monkeypatch.setattr(env, "PROGRESS_ENABLED", False)
+
+    async def no_delay(_self, _attempts: int) -> None:
+        return None
+
+    monkeypatch.setattr(RelightRunner, "_retry_delay", no_delay)
+    images = _make_input(tmp_path)
+    item = discover_images(images)[0]
+    qwen, toapis = _configs()
+    generation = QueryErrorGenerationClient()
+    runner = RelightRunner(
+        images,
+        tmp_path / "run",
+        1,
+        qwen,
+        toapis,
+        new_items=[item],
+        vision_client=FakeVisionClient({"a.jpg": _decision(True)}),
+        generation_client=generation,
+    )
+    result = asyncio.run(runner.run())
+    row = runner.state.get(item[0])
+    asyncio.run(runner.close())
+    assert result["deferred_pending"] is True
+    assert result["quota_consumed"] == 0
+    assert row["stage"] == "selected"
+    assert row["business_id"]
+    assert row["generation_attempts"] == env.RELIGHT_STAGE_MAX_ATTEMPTS - 1
+    assert generation.upload_calls == []
+    assert generation.submit_calls == []
 
 
 def test_pending_remote_timeout_remains_resumable(

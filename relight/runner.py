@@ -83,6 +83,7 @@ class RelightRunner:
         self.prompts_root.mkdir(parents=True, exist_ok=True)
         self.internal_root.mkdir(parents=True, exist_ok=True)
         self.state = RelightState(self.internal_root / "state.sqlite3")
+        self.run_id = self.state.run_id()
         if new_items is not None:
             self.state.add_items(new_items)
         self.qwen_config = qwen_config
@@ -441,7 +442,7 @@ class RelightRunner:
                 business_id = current.get("business_id") or (
                     "relight-"
                     + hashlib.sha256(
-                        f"{self.run_root.name}:{item_id}".encode("utf-8")
+                        f"{self.run_id}:{item_id}".encode("utf-8")
                     ).hexdigest()[:32]
                 )
                 if not current.get("business_id"):
@@ -613,10 +614,17 @@ class RelightRunner:
                         exc, (TimeoutError, ConnectionError, aiohttp.ClientError)
                     )
                 )
-                if not retryable or int(current["generation_attempts"]) >= env.RELIGHT_STAGE_MAX_ATTEMPTS:
+                if not retryable:
                     return self._fail_generation(
                         item_id, current, selection, error
                     )
+                if int(current["generation_attempts"]) >= env.RELIGHT_STAGE_MAX_ATTEMPTS:
+                    # 查询、提交超时或响应损坏时，远端可能已经创建付费任务。
+                    # 保留selected与业务/任务ID，停止本轮并让--resume继续核对。
+                    self.state.decrement_attempt(item_id, "generation_attempts")
+                    self.state.update(item_id, error=error)
+                    self.deferred_event.set()
+                    return "deferred"
                 self.state.update(item_id, error=error)
                 await self._retry_delay(int(current["generation_attempts"]))
 
@@ -629,6 +637,14 @@ class RelightRunner:
         return stage
 
     async def run(self) -> dict[str, Any]:
+        recovered = self.state.recover_invalid_response_failures()
+        if recovered:
+            self.state.add_event(
+                "legacy_failures_recovered",
+                "invalid_response",
+                f"恢复{recovered}个可继续查询的旧版误判任务",
+                None,
+            )
         full_scan = self.target_count is None
         completed = self.state.completed_count()
         failed_total = self.state.counts().get("failed", 0)

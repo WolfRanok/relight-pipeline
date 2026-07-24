@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -78,10 +79,47 @@ class RelightState:
             )
             """
         )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS relight_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         self.connection.commit()
 
     def close(self) -> None:
         self.connection.close()
+
+    def run_id(self) -> str:
+        """返回持久化运行UUID；同目录续跑稳定，目录删除重建后不会复用旧ID。"""
+
+        row = self.connection.execute(
+            "SELECT value FROM relight_metadata WHERE key='run_id'"
+        ).fetchone()
+        if row is not None:
+            return str(row["value"])
+        value = uuid.uuid4().hex
+        self.connection.execute(
+            "INSERT INTO relight_metadata(key,value) VALUES('run_id',?)", (value,)
+        )
+        self.connection.commit()
+        return value
+
+    def recover_invalid_response_failures(self) -> int:
+        """恢复旧版本因HTTP 200异常JSON而误判失败的可查询生图任务。"""
+
+        cursor = self.connection.execute(
+            "UPDATE relight_items SET stage='selected',generation_attempts=0,"
+            "result_json=NULL,error=NULL,updated_at=? "
+            "WHERE stage='failed' AND selection_json IS NOT NULL "
+            "AND business_id IS NOT NULL "
+            "AND error LIKE '%HTTP 200返回非JSON响应%'",
+            (_now(),),
+        )
+        self.connection.commit()
+        return int(cursor.rowcount)
 
     def add_items(self, items: Iterable[tuple[str, str, str]]) -> None:
         self.connection.executemany(
