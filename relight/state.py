@@ -190,16 +190,40 @@ class RelightState:
         )
         self.connection.commit()
 
-    def increment_attempt(self, item_id: str, field: str) -> int:
+    def _adjust_attempt(
+        self,
+        item_id: str,
+        field: str,
+        delta: int,
+        **fields: Any,
+    ) -> int:
+        """原子调整尝试次数并合并同一状态转换中的其他字段。"""
+
         if field not in {"vl_attempts", "generation_attempts"}:
             raise ValueError(f"非法尝试字段：{field}")
+        fields["updated_at"] = _now()
+        assignments = [f"{field}=MAX({field}+?,0)"]
+        assignments.extend(f"{name}=?" for name in fields)
         self.connection.execute(
-            f"UPDATE relight_items SET {field}={field}+1,error=NULL,updated_at=? "
-            "WHERE item_id=?",
-            (_now(), item_id),
+            f"UPDATE relight_items SET {','.join(assignments)} WHERE item_id=?",
+            [delta, *fields.values(), item_id],
         )
+        row = self.connection.execute(
+            f"SELECT {field} FROM relight_items WHERE item_id=?", (item_id,)
+        ).fetchone()
+        if row is None:
+            self.connection.rollback()
+            raise KeyError(f"Relight任务不存在：{item_id}")
         self.connection.commit()
-        return int(self.get(item_id)[field])
+        return int(row[field])
+
+    def increment_attempt(
+        self, item_id: str, field: str, **fields: Any
+    ) -> int:
+        """开始一次阶段尝试，并清除上一次可重试错误。"""
+
+        fields.setdefault("error", None)
+        return self._adjust_attempt(item_id, field, 1, **fields)
 
     def save_json(
         self,
@@ -227,17 +251,12 @@ class RelightState:
         ).fetchone()
         return int(row["count"])
 
-    def decrement_attempt(self, item_id: str, field: str) -> None:
+    def decrement_attempt(
+        self, item_id: str, field: str, **fields: Any
+    ) -> None:
         """熔断或远端仍在运行时撤销本次计数，避免耗尽单图重试额度。"""
 
-        if field not in {"vl_attempts", "generation_attempts"}:
-            raise ValueError(f"非法尝试字段：{field}")
-        self.connection.execute(
-            f"UPDATE relight_items SET {field}=MAX({field}-1,0),updated_at=? "
-            "WHERE item_id=?",
-            (_now(), item_id),
-        )
-        self.connection.commit()
+        self._adjust_attempt(item_id, field, -1, **fields)
 
     def add_event(
         self, event_type: str, category: str, message: str, item_id: str | None

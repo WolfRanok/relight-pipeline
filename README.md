@@ -1,6 +1,6 @@
 # Relight 图片重打光流水线
 
-本项目只处理已有图片目录：Qwen VL判断图片是否适合重打光并生成中英文指令，通过后调用ToAPIs图片模型生成一张重打光结果。它不负责下载数据集，也不执行尺寸、水印、人脸或场景筛选。
+本项目只处理已有图片目录：Qwen VL判断图片是否适合重打光并生成中英文指令，通过后调用可配置的茉莉或ToAPIs图片模型生成一张重打光结果。它不负责下载数据集，也不执行尺寸、水印、人脸或场景筛选。
 
 ## 安装
 
@@ -12,9 +12,9 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-`.venv`是每台机器独立创建的运行环境，按Python项目惯例不会上传GitHub；
-第三方依赖由`requirements.txt`或`pyproject.toml`声明并自动安装。其他项目也可
-直接安装本仓库的核心功能：
+`.venv`是每台机器独立创建的运行环境，按Python项目惯例不会上传GitHub。
+第三方依赖版本统一由`pyproject.toml`维护，`requirements.txt`只是包含OSS和测试
+依赖的一键开发安装入口。其他项目也可直接安装本仓库的核心功能：
 
 ```powershell
 pip install -e .
@@ -32,7 +32,9 @@ pip install -e ".[oss]"
 pip install -e ".[dev,oss]"
 ```
 
-Qwen密钥保存在`APIKEY.txt`，ToAPIs密钥保存在`TOAPIS_APIKEY.txt`，每个文件只放一行Key。也可以使用`DASHSCOPE_API_KEY`和`TOAPIS_API_KEY`环境变量临时覆盖。密钥不会进入运行结果。
+Qwen密钥保存在`APIKEY.txt`，ToAPIs密钥保存在`TOAPIS_APIKEY.txt`，茉莉密钥保存在`MOLI_APIKEY.txt`，每个文件只放一行Key。也可以分别使用`DASHSCOPE_API_KEY`、`TOAPIS_API_KEY`和`MOLI_API_KEY`环境变量临时覆盖。密钥不会进入运行结果。
+
+生图渠道由`env.py`中的`RELIGHT_IMAGE_PROVIDER`选择，可设为`"moli"`或`"toapis"`。新运行使用当前选择，`--resume`始终沿用运行目录已经记录的渠道。茉莉2K需要令牌属于官转及以上分组；默认分组和Codex专属分组只支持1K。
 
 ## 使用
 
@@ -69,7 +71,7 @@ output/YYYY-MM-DD/数据集名称_编号/
    └─ run_config.json
 ```
 
-提示词JSON只包含`edit_prompt`中文指令和`edit_prompt_en`英文原指令。`RELIGHT_RESOLUTION="2k"`控制服务端输出档位，不是输入筛选条件；程序会将源图比例传给模型。
+提示词JSON只包含`edit_prompt`中文指令和`edit_prompt_en`英文原指令。`RELIGHT_RESOLUTION="2k"`控制服务端输出档位，不是输入筛选条件；程序会将源图比例传给模型。茉莉模式会在落盘前额外验证长边至少2048且短边至少1024。
 
 ## OSS选项
 

@@ -131,20 +131,35 @@ def classify_toapis_error(
             "无可用渠道", "可用渠道失败",
         )
     )
-    if auth_or_account or unavailable_model:
+    if auth_or_account:
         return RelightGenerationError(
             f"ToAPIs HTTP {status}: {message}",
-            category="account_unavailable" if auth_or_account else "model_channel_unavailable",
+            category="account_unavailable",
             circuit_breaker=True,
-            stop_all_network=auth_or_account,
+            stop_all_network=True,
             http_status=status,
             error_code=code,
         )
+    # 503等状态表示当前渠道暂时无法承接请求，即使网关错误码写成
+    # model_not_found也不能据此认定模型永久下线。先走有限重试，耗尽后由Runner
+    # 安全暂停并保留SQLite状态，避免一次上游抖动立即熔断整条生产线。
     if status in {408, 425, 429, 500, 502, 503, 504}:
         return RelightGenerationError(
             f"ToAPIs HTTP {status}: {message}",
-            category="transient_http",
+            category=(
+                "channel_temporarily_unavailable"
+                if unavailable_model
+                else "transient_http"
+            ),
             retryable=True,
+            http_status=status,
+            error_code=code,
+        )
+    if unavailable_model:
+        return RelightGenerationError(
+            f"ToAPIs HTTP {status}: {message}",
+            category="model_channel_unavailable",
+            circuit_breaker=True,
             http_status=status,
             error_code=code,
         )
@@ -235,6 +250,18 @@ def _mime_type(path: Path) -> str:
     }.get(path.suffix.lower(), "application/octet-stream")
 
 
+def create_http_session(timeout_seconds: float) -> aiohttp.ClientSession:
+    """按全局连接池限制创建生图渠道共用的HTTP会话。"""
+
+    connector = aiohttp.TCPConnector(
+        limit=env.RELIGHT_HTTP_CONNECTION_LIMIT,
+    )
+    return aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+        connector=connector,
+    )
+
+
 def save_generated_bytes(payload: bytes, destination: Path) -> None:
     """完整解码验证；编码一致时保留原字节，否则按目标扩展名转码。"""
 
@@ -290,13 +317,7 @@ class RelightGenerationClient:
         self.quality = quality or env.RELIGHT_IMAGE_QUALITY
         # 构造客户端时即验证模型，避免完成上传后才发现模型名不可用。
         generation_request_profile(config.model, self.resolution, self.quality)
-        # 分阶段并发总量可能超过aiohttp默认100连接，显式放宽连接池，
-        # 具体API压力仍由Runner中的各阶段Semaphore严格约束。
-        connector = aiohttp.TCPConnector(limit=170, limit_per_host=120)
-        self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=env.RELIGHT_API_TIMEOUT_SECONDS),
-            connector=connector,
-        )
+        self.session = create_http_session(env.RELIGHT_API_TIMEOUT_SECONDS)
 
     @property
     def headers(self) -> dict[str, str]:
@@ -440,9 +461,3 @@ class RelightGenerationClient:
                     payload = {"message": "结果URL下载失败"}
                 raise classify_toapis_error(response.status, payload)
             return await response.read()
-
-    async def download_result(self, url: str, destination: Path) -> None:
-        """兼容旧调用；正式Runner使用下载与编码拆分接口。"""
-
-        payload = await self.download_result_bytes(url)
-        await asyncio.to_thread(save_generated_bytes, payload, destination)

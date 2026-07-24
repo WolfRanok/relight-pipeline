@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
 import random
 import shutil
@@ -16,7 +15,7 @@ import aiohttp
 from tqdm.auto import tqdm
 
 import env
-from relight.config import QwenConfig, ToApisConfig
+from relight.config import MoliConfig, QwenConfig, ToApisConfig
 from relight.utils import write_json_atomic, write_jsonl_atomic
 from relight.generator import (
     RelightGenerationClient,
@@ -26,8 +25,9 @@ from relight.generator import (
     generation_request_profile,
     save_generated_bytes,
 )
-from relight.images import PreparedRelightImage, prepare_relight_image
+from relight.images import prepare_relight_image
 from relight.io import discover_images, validate_input_directory
+from relight.moli import MoliGenerationClient, moli_request_profile
 from relight.prompts import build_generation_prompt
 from relight.state import ACTIVE_STAGES, RelightState
 from relight.vl import RelightVisionClient
@@ -62,7 +62,7 @@ class RelightRunner:
         run_root: Path,
         target_count: int | None,
         qwen_config: QwenConfig,
-        toapis_config: ToApisConfig,
+        toapis_config: ToApisConfig | MoliConfig,
         *,
         new_items: list[tuple[str, str, str]] | None = None,
         vision_client: Any | None = None,
@@ -88,19 +88,37 @@ class RelightRunner:
             self.state.add_items(new_items)
         self.qwen_config = qwen_config
         self.toapis_config = toapis_config
+        self.image_provider = getattr(toapis_config, "provider", "toapis")
         self.resolution = resolution or env.RELIGHT_RESOLUTION
         self.image_quality = image_quality or env.RELIGHT_IMAGE_QUALITY
         self.prompt_version = prompt_version or env.RELIGHT_PROMPT_VERSION
         self.vision = vision_client or RelightVisionClient(qwen_config)
-        self.generator = generation_client or RelightGenerationClient(
-            toapis_config,
-            resolution=self.resolution,
-            quality=self.image_quality,
-        )
+        if generation_client is not None:
+            self.generator = generation_client
+        elif self.image_provider == "moli":
+            self.generator = MoliGenerationClient(
+                toapis_config,
+                resolution=self.resolution,
+                quality=self.image_quality,
+            )
+        else:
+            self.generator = RelightGenerationClient(
+                toapis_config,
+                resolution=self.resolution,
+                quality=self.image_quality,
+            )
         self.oss = oss_client
         self.vl_semaphore = asyncio.Semaphore(env.RELIGHT_VL_CONCURRENCY)
+        self.remote_generation_limit = (
+            min(
+                env.RELIGHT_GENERATION_CONCURRENCY,
+                env.RELIGHT_MOLI_GENERATION_CONCURRENCY,
+            )
+            if self.image_provider == "moli"
+            else env.RELIGHT_GENERATION_CONCURRENCY
+        )
         self.remote_generation_semaphore = asyncio.Semaphore(
-            env.RELIGHT_GENERATION_CONCURRENCY
+            self.remote_generation_limit
         )
         self.upload_semaphore = asyncio.Semaphore(env.RELIGHT_UPLOAD_CONCURRENCY)
         self.submit_semaphore = asyncio.Semaphore(env.RELIGHT_SUBMIT_CONCURRENCY)
@@ -216,40 +234,18 @@ class RelightRunner:
                 self.stop_network_event.set()
             self.circuit_event.set()
 
-    async def _analyze_prepared(
-        self, source: Path, prepared: PreparedRelightImage
-    ) -> Any:
-        """调用支持预生成预览的新接口，并兼容测试或旧自定义客户端。"""
+    async def _download_and_save(
+        self, result: str | bytes, destination: Path
+    ) -> None:
+        """统一保存同步字节或URL结果，并把下载与CPU编码分开限流。"""
 
-        parameters = inspect.signature(self.vision.analyze).parameters
-        if len(parameters) >= 2:
-            return await self.vision.analyze(source, prepared.preview_data_url)
-        return await self.vision.analyze(source)
-
-    async def _wait_for_result(self, task_id: str) -> str:
-        parameters = inspect.signature(self.generator.wait_for_result).parameters
-        accepts_keywords = any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
-        )
-        if "poll_semaphore" in parameters or accepts_keywords:
-            return await self.generator.wait_for_result(
-                task_id,
-                poll_semaphore=self.poll_semaphore,
-                stop_network=self.stop_network_event,
-            )
-        return await self.generator.wait_for_result(task_id)
-
-    async def _download_and_save(self, url: str, destination: Path) -> None:
-        """把网络下载和CPU编码拆成两个独立并发阶段。"""
-
-        download_bytes = getattr(self.generator, "download_result_bytes", None)
-        if download_bytes is None:
-            async with self.download_semaphore:
-                await self.generator.download_result(url, destination)
+        if isinstance(result, bytes):
+            async with self.encode_semaphore:
+                await asyncio.to_thread(save_generated_bytes, result, destination)
             return
+
         async with self.download_semaphore:
-            payload = await download_bytes(url)
+            payload = await self.generator.download_result_bytes(result)
         async with self.encode_semaphore:
             await asyncio.to_thread(save_generated_bytes, payload, destination)
 
@@ -257,6 +253,29 @@ class RelightRunner:
         """指数退避加入抖动，避免大量任务在同一时刻再次请求。"""
 
         await asyncio.sleep((2 ** max(0, attempts - 1)) + random.uniform(0, 0.5))
+
+    async def _rate_limit_delay(self, attempts: int) -> None:
+        """429明确拒绝未计费，使用更长退避等待渠道释放容量。"""
+
+        await asyncio.sleep(
+            env.RELIGHT_RATE_LIMIT_RETRY_SECONDS * attempts
+            + random.uniform(0, 1)
+        )
+
+    def _image_request_profile(self) -> dict[str, Any]:
+        """集中生成当前渠道可公开记录的请求配置。"""
+
+        if self.image_provider == "moli":
+            return moli_request_profile(
+                self.toapis_config.model,
+                self.resolution,
+                self.image_quality,
+            )
+        return generation_request_profile(
+            self.toapis_config.model,
+            self.resolution,
+            self.image_quality,
+        )
 
     def _fail_generation(
         self,
@@ -280,6 +299,178 @@ class RelightRunner:
         )
         return "failed"
 
+    async def _submit_moli(
+        self,
+        item_id: str,
+        row: dict[str, Any],
+        source: Path,
+        generation_prompt: str,
+        business_id: str,
+    ) -> bytes | None:
+        """提交不可查询的茉莉同步任务；None表示本轮应安全停止。"""
+
+        if bool(row.get("submission_started")):
+            raise RelightGenerationError(
+                "茉莉同步任务曾开始提交但没有可恢复结果，已禁止自动重提",
+                category="ambiguous_submission",
+            )
+        if self.circuit_event.is_set() or self.deferred_event.is_set():
+            self.state.decrement_attempt(item_id, "generation_attempts")
+            return None
+        # OSS在茉莉模式下只缓存输入和发布交付物；模型仍直接上传本地源图。
+        if self.oss is not None and not row.get("oss_input_key"):
+            oss_input_key = await self.oss.ensure_input(
+                source, str(row["source_sha256"])
+            )
+            self.state.update(item_id, oss_input_key=oss_input_key)
+            row["oss_input_key"] = oss_input_key
+        async with self.submit_semaphore:
+            # 同步接口发出后无法查询，因此必须在可能计费前持久化保护标志。
+            self.state.update(item_id, submission_started=1)
+            row["submission_started"] = 1
+            return await self.generator.generate_image(
+                source,
+                generation_prompt,
+                str(row.get("aspect_ratio") or "1:1"),
+                business_id,
+            )
+
+    async def _ensure_toapis_task(
+        self,
+        item_id: str,
+        row: dict[str, Any],
+        source: Path,
+        generation_prompt: str,
+        business_id: str,
+    ) -> str | None:
+        """优先恢复ToAPIs既有任务，仅在确认不存在时创建新任务。"""
+
+        task_id = row.get("task_id")
+        if task_id:
+            return str(task_id)
+        if self.circuit_event.is_set() or self.deferred_event.is_set():
+            self.state.decrement_attempt(item_id, "generation_attempts")
+            return None
+
+        existing = None
+        if bool(row.get("submission_started")):
+            # 只有请求可能发出时才查重；全新业务ID查询会触发ToAPIs网关异常。
+            async with self.poll_semaphore:
+                existing = await self.generator.query_task(
+                    business_id, allow_missing=True
+                )
+        if existing:
+            task_id = str(existing.get("id") or business_id)
+        else:
+            if self.oss is not None:
+                oss_input_key = row.get("oss_input_key")
+                if not oss_input_key:
+                    oss_input_key = await self.oss.ensure_input(
+                        source, str(row["source_sha256"])
+                    )
+                    self.state.update(item_id, oss_input_key=oss_input_key)
+                    row["oss_input_key"] = oss_input_key
+                # 签名URL具有时效性，每次提交前生成且绝不写入SQLite。
+                upload_url = await self.oss.presign_get(str(oss_input_key))
+            else:
+                upload_url = row.get("upload_url")
+                if not upload_url:
+                    async with self.upload_semaphore:
+                        upload_url = await self.generator.upload_image(source)
+                    self.state.update(item_id, upload_url=upload_url)
+                    row["upload_url"] = upload_url
+
+            async with self.submit_semaphore:
+                if self.circuit_event.is_set() or self.deferred_event.is_set():
+                    self.state.decrement_attempt(item_id, "generation_attempts")
+                    return None
+                # 在可能计费前先落盘；响应丢失后续跑会按业务ID查重。
+                self.state.update(item_id, submission_started=1)
+                row["submission_started"] = 1
+                task_id = await self.generator.submit_generation(
+                    str(upload_url),
+                    generation_prompt,
+                    str(row.get("aspect_ratio") or "1:1"),
+                    business_id,
+                )
+
+        self.state.update(item_id, task_id=task_id)
+        row["task_id"] = task_id
+        return str(task_id)
+
+    async def _deliver_generated(
+        self,
+        item_id: str,
+        row: dict[str, Any],
+        source: Path,
+        selection: dict[str, Any],
+        generation_prompt: str,
+        generated: str | bytes,
+    ) -> str:
+        """统一完成结果下载、原子本地交付、可选OSS发布和最终状态落盘。"""
+
+        original_destination, destination = self._paired_paths(row)
+        await self._download_and_save(generated, destination)
+        await asyncio.to_thread(
+            self._copy_original_atomic, source, original_destination
+        )
+        await asyncio.to_thread(self._write_prompt, row, selection)
+
+        original_relative = (
+            Path("图片") / str(row["output_path"]) / original_destination.name
+        ).as_posix()
+        result_relative = (
+            Path("图片") / str(row["output_path"]) / destination.name
+        ).as_posix()
+        prompt_relative = (
+            Path("提示词") / Path(str(row["output_path"])).with_suffix(".json")
+        ).as_posix()
+        current = self.state.get(item_id)
+        oss_objects: dict[str, str] | None = None
+        if self.oss is not None:
+            oss_objects = await self.oss.publish_delivery(
+                self.run_root.name,
+                str(current["oss_input_key"]),
+                original_relative,
+                destination,
+                result_relative,
+                self._prompt_path(row),
+                prompt_relative,
+            )
+            self.state.update(
+                item_id, oss_output_prefix=oss_objects["output_prefix"]
+            )
+
+        result = {
+            "image_id": item_id,
+            "source_path": row["source_path"],
+            "source_sha256": row["source_sha256"],
+            "item_directory": (
+                Path("图片") / str(row["output_path"])
+            ).as_posix(),
+            "original_path": original_relative,
+            "output_path": result_relative,
+            "prompt_path": prompt_relative,
+            "selection": selection,
+            "generation_prompt": generation_prompt,
+            "vl_model": self.qwen_config.model,
+            "image_model": self.toapis_config.model,
+            "image_provider": self.image_provider,
+            "resolution": self.resolution,
+            "image_request_profile": self._image_request_profile(),
+            "prompt_version": self.prompt_version,
+            "business_id": current.get("business_id"),
+            "task_id": current.get("task_id"),
+            "status": "completed",
+        }
+        if oss_objects is not None:
+            # 仅记录稳定对象键，绝不记录可访问私有图片的签名URL。
+            result["oss_objects"] = oss_objects
+        self.state.save_json(
+            item_id, "result_json", result, stage="completed", error=None
+        )
+        return "completed"
+
     async def _select(self, item_id: str) -> str:
         row = self.state.get(item_id)
         if row["stage"] != "pending" or self.circuit_event.is_set():
@@ -288,15 +479,6 @@ class RelightRunner:
         try:
             # 本地损坏、格式异常属于单图永久失败，不进行无意义的API重试。
             prepared = await asyncio.to_thread(prepare_relight_image, source)
-            self.state.update(
-                item_id,
-                source_sha256=prepared.sha256,
-                width=prepared.width,
-                height=prepared.height,
-                image_format=prepared.image_format,
-                aspect_ratio=prepared.aspect_ratio,
-                error=None,
-            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -324,13 +506,16 @@ class RelightRunner:
                     error=row.get("error") or "vl_failed_after_max_attempts",
                 )
                 return "failed"
+            attempts = int(row["vl_attempts"])
             try:
-                self.state.increment_attempt(item_id, "vl_attempts")
+                attempts = self.state.increment_attempt(item_id, "vl_attempts")
                 async with self.vl_semaphore:
                     if self.circuit_event.is_set():
                         self.state.decrement_attempt(item_id, "vl_attempts")
                         return "pending"
-                    decision = await self._analyze_prepared(source, prepared)
+                    decision = await self.vision.analyze(
+                        source, prepared.preview_data_url
+                    )
                 selection = decision.to_dict()
                 base = {
                     "image_id": item_id,
@@ -348,6 +533,10 @@ class RelightRunner:
                         selection,
                         stage="skipped",
                         source_sha256=prepared.sha256,
+                        width=prepared.width,
+                        height=prepared.height,
+                        image_format=prepared.image_format,
+                        aspect_ratio=prepared.aspect_ratio,
                         result_json=json.dumps(base, ensure_ascii=False),
                         error=None,
                     )
@@ -358,6 +547,10 @@ class RelightRunner:
                     selection,
                     stage="selected",
                     source_sha256=prepared.sha256,
+                    width=prepared.width,
+                    height=prepared.height,
+                    image_format=prepared.image_format,
+                    aspect_ratio=prepared.aspect_ratio,
                     error=None,
                 )
                 return "selected"
@@ -371,13 +564,13 @@ class RelightRunner:
                     else _generic_circuit_error(exc)
                 )
                 if circuit_error is not None:
-                    self.state.decrement_attempt(item_id, "vl_attempts")
+                    self.state.decrement_attempt(
+                        item_id, "vl_attempts", error=str(circuit_error)
+                    )
                     await self._open_circuit(item_id, circuit_error)
-                    self.state.update(item_id, error=str(circuit_error))
                     return "pending"
                 error = f"{type(exc).__name__}: {exc}"
-                current = self.state.get(item_id)
-                if int(current["vl_attempts"]) >= env.RELIGHT_STAGE_MAX_ATTEMPTS:
+                if attempts >= env.RELIGHT_STAGE_MAX_ATTEMPTS:
                     failure = {
                         "image_id": item_id,
                         "source_path": row["source_path"],
@@ -390,14 +583,16 @@ class RelightRunner:
                     )
                     return "failed"
                 self.state.update(item_id, error=error)
-                await self._retry_delay(int(current["vl_attempts"]))
+                await self._retry_delay(attempts)
 
     async def _generate(self, item_id: str) -> str:
         while True:
             row = self.state.get(item_id)
             if row["stage"] != "selected":
                 return str(row["stage"])
-            already_submitted = bool(row.get("task_id"))
+            already_submitted = bool(row.get("task_id")) or (
+                self.image_provider == "moli" and bool(row.get("submission_started"))
+            )
             # 熔断后仅允许已经提交并持久化task_id的付费任务继续收尾。
             if self.stop_network_event.is_set() or (
                 (self.circuit_event.is_set() or self.deferred_event.is_set())
@@ -434,165 +629,77 @@ class RelightRunner:
                         selection,
                         f"{type(exc).__name__}: {exc}",
                     )
-            original_destination, destination = self._paired_paths(row)
             selection = json.loads(row["selection_json"] or "{}")
+            generation_prompt = build_generation_prompt(
+                str(selection["edit_prompt_en"])
+            )
             try:
-                self.state.increment_attempt(item_id, "generation_attempts")
-                current = self.state.get(item_id)
-                business_id = current.get("business_id") or (
+                business_id = row.get("business_id") or (
                     "relight-"
                     + hashlib.sha256(
                         f"{self.run_id}:{item_id}".encode("utf-8")
                     ).hexdigest()[:32]
                 )
-                if not current.get("business_id"):
-                    # 先保存业务ID，请求超时后才能查询已提交付费任务。
-                    self.state.update(item_id, business_id=business_id)
+                # 尝试次数和确定性业务ID属于同一个本地状态转换，一次提交即可；
+                # 它们仍然会在任何外部生图请求之前完成持久化。
+                attempts = self.state.increment_attempt(
+                    item_id, "generation_attempts", business_id=business_id
+                )
+                row["generation_attempts"] = attempts
+                row["business_id"] = business_id
 
                 async with self.remote_generation_semaphore:
+                    # 等待远端名额期间可能发生熔断；重新读取也是续跑安全边界。
                     persisted = self.state.get(item_id)
-                    task_id = persisted.get("task_id")
-                    if not task_id:
-                        if self.circuit_event.is_set() or self.deferred_event.is_set():
+                    if self.image_provider == "moli":
+                        direct_payload = await self._submit_moli(
+                            item_id,
+                            persisted,
+                            source,
+                            generation_prompt,
+                            str(business_id),
+                        )
+                        if direct_payload is None:
+                            return "selected"
+                        generated: str | bytes = direct_payload
+                    else:
+                        task_id = await self._ensure_toapis_task(
+                            item_id,
+                            persisted,
+                            source,
+                            generation_prompt,
+                            str(business_id),
+                        )
+                        if task_id is None:
+                            return "selected"
+                        if self.stop_network_event.is_set():
                             self.state.decrement_attempt(
                                 item_id, "generation_attempts"
                             )
                             return "selected"
-                        existing = None
-                        if bool(persisted.get("submission_started")):
-                            # 只有请求可能已经发出时才按业务ID查重。全新ID尚未
-                            # 提交，ToAPIs会错误返回new_api_panic而不是404。
-                            async with self.poll_semaphore:
-                                existing = await self.generator.query_task(
-                                    str(business_id), allow_missing=True
-                                )
-                        if existing:
-                            task_id = str(existing.get("id") or business_id)
-                        else:
-                            # 只有确认远端不存在同一业务任务后才准备输入，避免
-                            # 续跑已提交任务时重复上传或生成无用签名URL。
-                            if self.oss is not None:
-                                oss_input_key = current.get("oss_input_key")
-                                if not oss_input_key:
-                                    oss_input_key = await self.oss.ensure_input(
-                                        source, str(current["source_sha256"])
-                                    )
-                                    self.state.update(
-                                        item_id, oss_input_key=oss_input_key
-                                    )
-                                # 签名URL具有时效性，每次提交前即时生成且绝不入库。
-                                upload_url = await self.oss.presign_get(
-                                    str(oss_input_key)
-                                )
-                            else:
-                                upload_url = current.get("upload_url")
-                                if not upload_url:
-                                    async with self.upload_semaphore:
-                                        upload_url = await self.generator.upload_image(
-                                            source
-                                        )
-                                    self.state.update(item_id, upload_url=upload_url)
-                            async with self.submit_semaphore:
-                                if self.circuit_event.is_set() or self.deferred_event.is_set():
-                                    self.state.decrement_attempt(
-                                        item_id, "generation_attempts"
-                                    )
-                                    return "selected"
-                                # 在发出可能产生费用的请求之前先落盘。即使进程在
-                                # 响应返回前退出，续跑也会先查重而不是重复提交。
-                                self.state.update(item_id, submission_started=1)
-                                task_id = await self.generator.submit_generation(
-                                    str(upload_url),
-                                    build_generation_prompt(
-                                        str(selection["edit_prompt_en"])
-                                    ),
-                                    str(row.get("aspect_ratio") or "1:1"),
-                                    str(business_id),
-                                )
-                        self.state.update(item_id, task_id=task_id)
-
-                    if self.stop_network_event.is_set():
-                        self.state.decrement_attempt(item_id, "generation_attempts")
-                        return "selected"
-                    result_url = await self._wait_for_result(str(task_id))
+                        generated = await self.generator.wait_for_result(
+                            task_id,
+                            poll_semaphore=self.poll_semaphore,
+                            stop_network=self.stop_network_event,
+                        )
 
                 # 远端任务已经终态，先释放宝贵的生图名额再下载和本地编码。
-                await self._download_and_save(result_url, destination)
-                await asyncio.to_thread(
-                    self._copy_original_atomic, source, original_destination
+                return await self._deliver_generated(
+                    item_id,
+                    row,
+                    source,
+                    selection,
+                    generation_prompt,
+                    generated,
                 )
-                await asyncio.to_thread(self._write_prompt, row, selection)
-
-                original_relative = (
-                    Path("图片")
-                    / str(row["output_path"])
-                    / original_destination.name
-                ).as_posix()
-                result_relative = (
-                    Path("图片") / str(row["output_path"]) / destination.name
-                ).as_posix()
-                prompt_relative = (
-                    Path("提示词")
-                    / Path(str(row["output_path"])).with_suffix(".json")
-                ).as_posix()
-                oss_objects: dict[str, str] | None = None
-                if self.oss is not None:
-                    current = self.state.get(item_id)
-                    oss_objects = await self.oss.publish_delivery(
-                        self.run_root.name,
-                        str(current["oss_input_key"]),
-                        original_relative,
-                        destination,
-                        result_relative,
-                        self._prompt_path(row),
-                        prompt_relative,
-                    )
-                    self.state.update(
-                        item_id,
-                        oss_output_prefix=oss_objects["output_prefix"],
-                    )
-
-                result = {
-                    "image_id": item_id,
-                    "source_path": row["source_path"],
-                    "source_sha256": row["source_sha256"],
-                    "item_directory": (
-                        Path("图片") / str(row["output_path"])
-                    ).as_posix(),
-                    "original_path": original_relative,
-                    "output_path": result_relative,
-                    "prompt_path": prompt_relative,
-                    "selection": selection,
-                    "generation_prompt": build_generation_prompt(
-                        str(selection["edit_prompt_en"])
-                    ),
-                    "vl_model": self.qwen_config.model,
-                    "image_model": self.toapis_config.model,
-                    "resolution": self.resolution,
-                    "image_request_profile": generation_request_profile(
-                        self.toapis_config.model,
-                        self.resolution,
-                        self.image_quality,
-                    ),
-                    "prompt_version": self.prompt_version,
-                    "business_id": self.state.get(item_id).get("business_id"),
-                    "task_id": self.state.get(item_id).get("task_id"),
-                    "status": "completed",
-                }
-                if oss_objects is not None:
-                    # 仅记录稳定对象键，绝不记录可访问私有图片的签名URL。
-                    result["oss_objects"] = oss_objects
-                self.state.save_json(
-                    item_id, "result_json", result, stage="completed", error=None
-                )
-                return "completed"
             except asyncio.CancelledError:
                 raise
             except RelightTaskPendingTimeout as exc:
                 # 远端尚未终态，不能判失败或释放后继续超额提交新任务。
                 self._cleanup_pair(row)
-                self.state.decrement_attempt(item_id, "generation_attempts")
-                self.state.update(item_id, error=str(exc))
+                self.state.decrement_attempt(
+                    item_id, "generation_attempts", error=str(exc)
+                )
                 self.deferred_event.set()
                 return "deferred"
             except RelightNetworkStopped:
@@ -609,9 +716,12 @@ class RelightRunner:
                     else _generic_circuit_error(exc)
                 )
                 if circuit_error is not None:
-                    self.state.decrement_attempt(item_id, "generation_attempts")
+                    self.state.decrement_attempt(
+                        item_id,
+                        "generation_attempts",
+                        error=str(circuit_error),
+                    )
                     await self._open_circuit(item_id, circuit_error)
-                    self.state.update(item_id, error=str(circuit_error))
                     return "selected"
                 error = f"{type(exc).__name__}: {exc}"
                 current = self.state.get(item_id)
@@ -622,6 +732,12 @@ class RelightRunner:
                         exc, (TimeoutError, ConnectionError, aiohttp.ClientError)
                     )
                 )
+                if self.image_provider == "moli" and retryable:
+                    # 只有明确的429等未创建任务响应可安全重试；清除提交标志，
+                    # 否则下一轮会按“结果不确定”保护逻辑拒绝再次提交。
+                    retry_fields = {"submission_started": 0}
+                else:
+                    retry_fields = {}
                 if not retryable:
                     return self._fail_generation(
                         item_id, current, selection, error
@@ -629,12 +745,24 @@ class RelightRunner:
                 if int(current["generation_attempts"]) >= env.RELIGHT_STAGE_MAX_ATTEMPTS:
                     # 查询、提交超时或响应损坏时，远端可能已经创建付费任务。
                     # 保留selected与业务/任务ID，停止本轮并让--resume继续核对。
-                    self.state.decrement_attempt(item_id, "generation_attempts")
-                    self.state.update(item_id, error=error)
+                    self.state.decrement_attempt(
+                        item_id,
+                        "generation_attempts",
+                        error=error,
+                        **retry_fields,
+                    )
                     self.deferred_event.set()
                     return "deferred"
-                self.state.update(item_id, error=error)
-                await self._retry_delay(int(current["generation_attempts"]))
+                self.state.update(item_id, error=error, **retry_fields)
+                if (
+                    isinstance(exc, RelightGenerationError)
+                    and exc.category == "rate_limited"
+                ):
+                    await self._rate_limit_delay(
+                        int(current["generation_attempts"])
+                    )
+                else:
+                    await self._retry_delay(int(current["generation_attempts"]))
 
     async def _process_item(self, item_id: str) -> str:
         stage = str(self.state.get(item_id)["stage"])
@@ -672,12 +800,14 @@ class RelightRunner:
         submitted_rows = deque(
             row
             for row in active_rows
-            if row["stage"] == "selected" and row.get("task_id")
+            if row["stage"] == "selected"
+            and (row.get("task_id") or row.get("submission_started"))
         )
         selected_rows = deque(
             row
             for row in active_rows
-            if row["stage"] == "selected" and not row.get("task_id")
+            if row["stage"] == "selected"
+            and not (row.get("task_id") or row.get("submission_started"))
         )
         pending_rows = deque(
             row for row in active_rows if row["stage"] == "pending"
@@ -692,7 +822,7 @@ class RelightRunner:
             mininterval=env.PROGRESS_MIN_INTERVAL,
             disable=not env.PROGRESS_ENABLED,
         )
-        reviewed = skipped = failed = 0
+        skipped = failed = 0
         # 没有批次屏障；工作池容量由既有VL和生图并发自动推导。
         # 真正的API请求由各阶段Semaphore分别严格限制。
         pipeline_capacity = max(
@@ -737,21 +867,23 @@ class RelightRunner:
                 for task in done:
                     running.pop(task)
                     status = task.result()
-                    reviewed += 1
                     skipped += status == "skipped"
                     failed += status == "failed"
                     if status == "completed":
                         completed += 1
                     if status in {"completed", "failed"}:
                         quota_consumed += 1
+                    terminal = status in {"completed", "failed", "skipped"}
                     progress.update(
-                        1 if full_scan or status in {"completed", "failed"} else 0
+                        1
+                        if (full_scan and terminal)
+                        or (not full_scan and status in {"completed", "failed"})
+                        else 0
                     )
                 progress.set_postfix(
                     输出=completed,
                     跳过=skipped,
                     失败=failed,
-                    已审核=reviewed,
                     refresh=False,
                 )
                 fill_available_slots()
@@ -824,11 +956,8 @@ class RelightRunner:
                 "vl_model": self.qwen_config.model,
                 "image_model": self.toapis_config.model,
                 "resolution": self.resolution,
-                "image_request_profile": generation_request_profile(
-                    self.toapis_config.model,
-                    self.resolution,
-                    self.image_quality,
-                ),
+                "image_provider": self.image_provider,
+                "image_request_profile": self._image_request_profile(),
                 "prompt_version": self.prompt_version,
                 "oss": (
                     self.oss.public_config
@@ -844,7 +973,7 @@ class RelightRunner:
                     "vl": env.RELIGHT_VL_CONCURRENCY,
                     "upload": env.RELIGHT_UPLOAD_CONCURRENCY,
                     "submit": env.RELIGHT_SUBMIT_CONCURRENCY,
-                    "remote_generation": env.RELIGHT_GENERATION_CONCURRENCY,
+                    "remote_generation": self.remote_generation_limit,
                     "poll": env.RELIGHT_POLL_CONCURRENCY,
                     "download": env.RELIGHT_DOWNLOAD_CONCURRENCY,
                     "encode": env.RELIGHT_ENCODE_CONCURRENCY,

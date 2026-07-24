@@ -12,5 +12,6 @@ output/
 *.log
 APIKEY.txt
 TOAPIS_APIKEY.txt
+MOLI_APIKEY.txt
 OSS_CONFIG.local.md
 MODEL_CONFIG.local.md

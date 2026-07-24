@@ -27,6 +27,17 @@ class ToApisConfig:
     api_key: str
     base_url: str
     model: str
+    provider: str = "toapis"
+
+
+@dataclass(frozen=True)
+class MoliConfig:
+    """茉莉OpenAI兼容图片编辑接口所需的最小配置。"""
+
+    api_key: str
+    base_url: str
+    model: str
+    provider: str = "moli"
 
 
 @dataclass(frozen=True)
@@ -130,6 +141,34 @@ def load_toapis_config() -> ToApisConfig:
         base_url=env.TOAPIS_BASE_URL.rstrip("/"),
         model=env.RELIGHT_IMAGE_MODEL,
     )
+
+
+def load_moli_config() -> MoliConfig:
+    """加载茉莉凭据；密钥仅保存在内存中且不进入公开运行配置。"""
+
+    api_key = os.getenv("MOLI_API_KEY") or _read_api_key_file(env.MOLI_API_KEY_FILE)
+    if not api_key:
+        raise RuntimeError(
+            "未找到茉莉 API Key。请将 Key 写入项目根目录的 MOLI_APIKEY.txt，"
+            "或设置 MOLI_API_KEY。"
+        )
+    return MoliConfig(
+        api_key=api_key,
+        base_url=env.MOLI_BASE_URL.rstrip("/"),
+        model=env.RELIGHT_IMAGE_MODEL,
+    )
+
+
+def load_generation_config(provider: str | None = None) -> ToApisConfig | MoliConfig:
+    """按渠道名称加载生图配置，集中校验公开可选值。"""
+
+    selected = provider or env.RELIGHT_IMAGE_PROVIDER
+    if selected not in env.RELIGHT_IMAGE_PROVIDER_CHOICES:
+        raise ValueError(
+            f"不支持的生图渠道：{selected}；"
+            f"可选值为{', '.join(env.RELIGHT_IMAGE_PROVIDER_CHOICES)}"
+        )
+    return load_moli_config() if selected == "moli" else load_toapis_config()
 
 
 def _parse_duration_seconds(value: str) -> int:

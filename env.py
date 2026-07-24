@@ -19,9 +19,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 OUTPUT_ROOT = PROJECT_ROOT / "output"
 OUTPUT_TIMEZONE = "Asia/Shanghai"
 
-# Qwen和ToAPIs使用独立密钥文件。环境变量优先于文件，两个文件均被.gitignore排除。
+# Qwen、ToAPIs和茉莉使用独立密钥文件。环境变量优先于文件，文件均被.gitignore排除。
 API_KEY_FILE = PROJECT_ROOT / "APIKEY.txt"
 TOAPIS_API_KEY_FILE = PROJECT_ROOT / "TOAPIS_APIKEY.txt"
+MOLI_API_KEY_FILE = PROJECT_ROOT / "MOLI_APIKEY.txt"
 
 # Qwen本地配置仅作为Base URL回退来源；该文件被Git忽略，API Key优先使用环境变量和专用密钥文件。
 EXTERNAL_CONFIG_PATH = Path(
@@ -64,10 +65,17 @@ RELIGHT_VL_CONCURRENCY = 100
 
 
 # ---------------------------------------------------------------------------
-# ToAPIs重打光生成
+# 重打光生图渠道
 # ---------------------------------------------------------------------------
 
 TOAPIS_BASE_URL = "https://toapis.com"
+MOLI_BASE_URL = "https://moliapi.com/v1"
+
+# 生图渠道与模型分别配置。同一个gpt-image-2可由不同渠道提供；新运行读取这里的
+# 默认值，续跑严格使用run_config.json中已经持久化的渠道，避免跨渠道重复付费。
+RELIGHT_IMAGE_PROVIDER_CHOICES = ("moli", "toapis")
+# 新运行默认使用茉莉；需要切回ToAPIs时只修改这一处。
+RELIGHT_IMAGE_PROVIDER = "toapis"
 
 # Relight可选模型。切换只影响新运行；--resume沿用run_config.json中的模型。
 RELIGHT_IMAGE_MODEL_CHOICES = (
@@ -97,19 +105,32 @@ ALLOWED_RATIOS = (
 )
 
 # 远端在途生图任务上限，从提交前占用到任务进入终态。
-RELIGHT_GENERATION_CONCURRENCY = 300
+RELIGHT_GENERATION_CONCURRENCY = 100
+
+# 茉莉是同步长连接渠道；当前分组实测超过2个在途请求会大量返回“上游负载已
+# 饱和”。该上限只影响茉莉，不改变ToAPIs的远端在途并发。
+RELIGHT_MOLI_GENERATION_CONCURRENCY = 2
 
 # 生图前后阶段分别限流，防止某个慢阶段占住其他阶段的全部连接。
 # 这些值均不是批次大小，流水线始终按单图完成一个便补一个。
-RELIGHT_UPLOAD_CONCURRENCY = 200    # 直接模式下同时上传到ToAPIs的源图数量
-RELIGHT_SUBMIT_CONCURRENCY = 200    # 同时创建远端生图任务的请求数量
-RELIGHT_POLL_CONCURRENCY = 200      # 同时查询远端任务状态的HTTP请求数量
-RELIGHT_DOWNLOAD_CONCURRENCY = 200  # 同时下载生成结果的数量
-RELIGHT_ENCODE_CONCURRENCY = 200    # 同时进行结果解码、校验和必要转码的数量
+RELIGHT_UPLOAD_CONCURRENCY = 100    # 直接模式下同时上传到ToAPIs的源图数量
+RELIGHT_SUBMIT_CONCURRENCY = 100    # 同时创建远端生图任务的请求数量
+RELIGHT_POLL_CONCURRENCY = 100      # 同时查询远端任务状态的HTTP请求数量
+RELIGHT_DOWNLOAD_CONCURRENCY = 100  # 同时下载生成结果的数量
+RELIGHT_ENCODE_CONCURRENCY = 100    # 同时进行结果解码、校验和必要转码的数量
+
+# aiohttp生图连接池的全局上限。它独立于业务并发；生图并发设为300时，
+# 最多仍只有120个HTTP请求同时占用网络连接。
+RELIGHT_HTTP_CONNECTION_LIMIT = 120
 
 # VL和生图阶段的技术重试、请求超时与远端轮询窗口。
 RELIGHT_STAGE_MAX_ATTEMPTS = 3
+# 明确未计费的429限流使用较长退避，避免大量任务同步重试再次压满渠道。
+RELIGHT_RATE_LIMIT_RETRY_SECONDS = 30
 RELIGHT_API_TIMEOUT_SECONDS = 120
+# 茉莉图片编辑为同步长连接，2K/high实测可能超过通用120秒超时。
+# 单独放宽窗口，避免客户端过早断开后无法确认任务是否已经计费。
+RELIGHT_MOLI_TIMEOUT_SECONDS = 600
 RELIGHT_GENERATION_POLL_INTERVAL_SECONDS = 3
 RELIGHT_GENERATION_POLL_TIMEOUT_SECONDS = 600
 
@@ -127,7 +148,7 @@ RELIGHT_PROMPT_VERSION = "relight-natural-visible-v1"
 
 # 默认关闭。开启后源图按SHA-256缓存至私有OSS并提供短期签名URL；成功的
 # original、relight和提示词JSON同步到OSS，同时仍完整保留本地output结果。
-RELIGHT_OSS_ENABLED = True
+RELIGHT_OSS_ENABLED = False
 
 # None表示采用配置.md中的建议并发数；填写正整数可在不改配置文档的情况下限速。
 RELIGHT_OSS_CONCURRENCY_OVERRIDE: int | None = None

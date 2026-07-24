@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -18,10 +19,12 @@ from PIL import Image
 
 import env
 from relight.config import (
+    MoliConfig,
     OssConfig,
     QwenConfig,
     ToApisConfig,
     load_oss_config,
+    load_generation_config,
     load_toapis_config,
     public_oss_config,
 )
@@ -30,11 +33,19 @@ from relight.generator import (
     RelightTaskPendingTimeout,
     build_generation_payload,
     classify_toapis_error,
+    create_http_session,
     decode_toapis_json,
     generation_request_profile,
     save_generated_bytes,
 )
 from relight.io import allocate_output_run, discover_images, validate_input_directory
+from relight.moli import (
+    MoliSubmissionUncertain,
+    classify_moli_error,
+    decode_moli_image,
+    moli_2k_size,
+    validate_moli_2k,
+)
 from relight.runner import RelightRunner
 from relight.state import RelightState
 import relight.runner as relight_runner_module
@@ -75,7 +86,10 @@ class FakeVisionClient:
         self.decisions = decisions
         self.calls: list[str] = []
 
-    async def analyze(self, path: Path) -> RelightDecision:
+    async def analyze(
+        self, path: Path, preview_data_url: str | None = None
+    ) -> RelightDecision:
+        assert preview_data_url and preview_data_url.startswith("data:image/")
         self.calls.append(path.name)
         return self.decisions[path.name]
 
@@ -89,7 +103,10 @@ class FailFirstVisionClient:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def analyze(self, path: Path) -> RelightDecision:
+    async def analyze(
+        self, path: Path, preview_data_url: str | None = None
+    ) -> RelightDecision:
+        assert preview_data_url and preview_data_url.startswith("data:image/")
         self.calls.append(path.name)
         if len(self.calls) == 1:
             raise RuntimeError("simulated VL failure")
@@ -126,16 +143,42 @@ class FakeGenerationClient:
         self.submit_urls.append(image_url)
         return f"task-{business_id}"
 
-    async def wait_for_result(self, identifier: str) -> str:
+    async def wait_for_result(
+        self, identifier: str, *, poll_semaphore, stop_network
+    ) -> str:
+        assert poll_semaphore is not None
+        assert not stop_network.is_set()
         self.wait_calls.append(identifier)
         return f"https://result.invalid/{identifier}"
 
-    async def download_result(self, url: str, destination: Path) -> None:
-        self.download_calls.append(destination.as_posix())
+    async def download_result_bytes(self, url: str) -> bytes:
+        self.download_calls.append(url)
         buffer = io.BytesIO()
         # 模拟服务始终返回 PNG，验证正式代码会按照源文件扩展名重新编码。
         Image.new("RGB", (120, 80), (10, 20, 30)).save(buffer, format="PNG")
-        save_generated_bytes(buffer.getvalue(), destination)
+        return buffer.getvalue()
+
+    async def close(self) -> None:
+        return None
+
+
+class FakeMoliGenerationClient:
+    """模拟茉莉同步返回图片字节，不发出任何真实网络请求。"""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[tuple[str, str]] = []
+
+    async def generate_image(
+        self, path: Path, prompt: str, ratio: str, business_id: str
+    ) -> bytes:
+        del prompt, business_id
+        self.calls.append((path.name, ratio))
+        if self.error is not None:
+            raise self.error
+        buffer = io.BytesIO()
+        Image.new("RGB", (2048, 1365), (12, 34, 56)).save(buffer, format="PNG")
+        return buffer.getvalue()
 
     async def close(self) -> None:
         return None
@@ -305,6 +348,75 @@ def test_relight_model_choice_is_loaded_from_standalone_env(monkeypatch) -> None
     assert load_toapis_config().model == "gpt-image-2"
 
 
+def test_moli_config_and_2k_helpers(monkeypatch) -> None:
+    """茉莉凭据按独立环境变量加载，2K映射始终满足最短边要求。"""
+
+    monkeypatch.setenv("MOLI_API_KEY", "test-moli-key")
+    config = load_generation_config("moli")
+    assert isinstance(config, MoliConfig)
+    assert config.api_key == "test-moli-key"
+    assert config.base_url == "https://moliapi.com/v1"
+    assert moli_2k_size("1:1") == "2048x2048"
+    assert moli_2k_size("2:3") == "1360x2048"
+    assert moli_2k_size("3:2") == "2048x1360"
+    assert moli_2k_size("16:9") == "2048x1152"
+    assert moli_2k_size("2:1") == "2048x1024"
+    assert moli_2k_size("9:16") == "1152x2048"
+    with pytest.raises(ValueError, match="无法解析"):
+        moli_2k_size("invalid")
+
+    for ratio in (name for name, _width, _height in env.ALLOWED_RATIOS):
+        width, height = map(int, moli_2k_size(ratio).split("x"))
+        assert width % 16 == 0 and height % 16 == 0
+        assert max(width, height) == 2048
+        assert min(width, height) >= 1024
+
+    invalid_size = classify_moli_error(
+        429,
+        {"message": "Invalid size '1365x2048'. Width and height must both be divisible by 16."},
+    )
+    assert invalid_size.category == "request_rejected"
+    assert invalid_size.retryable is False
+    saturated = classify_moli_error(429, {"message": "当前分组上游负载已饱和"})
+    assert saturated.category == "rate_limited"
+    assert saturated.retryable is True
+
+
+def test_generation_http_session_uses_explicit_pool_limits(monkeypatch) -> None:
+    """连接池上限来自env.py，避免业务并发被隐藏常量悄悄截断。"""
+
+    monkeypatch.setattr(env, "RELIGHT_HTTP_CONNECTION_LIMIT", 23)
+
+    async def inspect_session() -> None:
+        session = create_http_session(1)
+        try:
+            assert session.connector.limit == 23
+            # 不设置额外的单主机上限，由唯一的全局连接池限制统一控制。
+            assert session.connector.limit_per_host == 0
+        finally:
+            await session.close()
+
+    asyncio.run(inspect_session())
+
+
+def test_moli_response_supports_base64_and_validates_delivery_size() -> None:
+    buffer = io.BytesIO()
+    Image.new("RGB", (2048, 1024), (1, 2, 3)).save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    kind, payload = decode_moli_image({"data": [{"b64_json": encoded}]})
+    assert kind == "bytes"
+    assert isinstance(payload, bytes)
+    assert validate_moli_2k(payload) == (2048, 1024)
+    assert decode_moli_image(
+        {"data": {"url": "https://result.invalid/image.png"}}
+    ) == ("url", "https://result.invalid/image.png")
+
+    low = io.BytesIO()
+    Image.new("RGB", (1536, 1024), (1, 2, 3)).save(low, format="PNG")
+    with pytest.raises(RelightGenerationError, match="未达到2K"):
+        validate_moli_2k(low.getvalue())
+
+
 def test_resume_pins_recorded_model_and_legacy_defaults_to_gpt(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -337,12 +449,81 @@ def test_resume_pins_recorded_model_and_legacy_defaults_to_gpt(
         "2k", "high", "locked-prompt-v1", "locked-vl-model"
     )
     assert restored[8] == {"enabled": False}
+    assert restored[9] == "toapis"
+
+    current = json.loads(config_path.read_text(encoding="utf-8"))
+    current["image_provider"] = "moli"
+    current["image_model"] = "gpt-image-2"
+    current["resolution"] = "2k"
+    config_path.write_text(json.dumps(current), encoding="utf-8")
+    assert _load_resume(run_root)[9] == "moli"
 
     # 兼容切换前创建、没有 image_model 字段的旧运行。
     legacy = json.loads(config_path.read_text(encoding="utf-8"))
     legacy.pop("image_model")
+    legacy.pop("image_provider")
     config_path.write_text(json.dumps(legacy), encoding="utf-8")
     assert _load_resume(run_root)[3] == "gpt-image-2"
+    assert _load_resume(run_root)[9] == "toapis"
+
+
+def test_moli_runner_completes_without_upload_or_polling(tmp_path: Path, monkeypatch) -> None:
+    """茉莉同步渠道直接处理本地源图，并在结果中记录渠道。"""
+
+    monkeypatch.setattr(env, "PROGRESS_ENABLED", False)
+    images = _make_input(tmp_path)
+    vision = FakeVisionClient({name: _decision(True) for name in ("a.jpg", "b.png", "c.webp")})
+    generation = FakeMoliGenerationClient()
+    qwen, _toapis = _configs()
+    config = MoliConfig("test-key", "https://moli.invalid/v1", "gpt-image-2")
+    runner = RelightRunner(
+        images,
+        tmp_path / "moli-run",
+        1,
+        qwen,
+        config,
+        new_items=discover_images(images),
+        vision_client=vision,
+        generation_client=generation,
+    )
+    assert runner.remote_generation_limit == env.RELIGHT_MOLI_GENERATION_CONCURRENCY
+    result = asyncio.run(runner.run())
+    completed = runner.state.rows({"completed"})
+    asyncio.run(runner.close())
+    assert result["completed"] == 1
+    assert len(generation.calls) == 1
+    payload = json.loads(completed[0]["result_json"])
+    assert payload["image_provider"] == "moli"
+    assert completed[0]["task_id"] is None
+
+
+def test_moli_ambiguous_submission_is_never_retried(tmp_path: Path, monkeypatch) -> None:
+    """同步响应丢失后任务终止，防止续跑再次产生费用。"""
+
+    monkeypatch.setattr(env, "PROGRESS_ENABLED", False)
+    images = _make_input(tmp_path)
+    vision = FakeVisionClient({name: _decision(True) for name in ("a.jpg", "b.png", "c.webp")})
+    generation = FakeMoliGenerationClient(
+        MoliSubmissionUncertain("simulated uncertain response")
+    )
+    qwen, _toapis = _configs()
+    config = MoliConfig("test-key", "https://moli.invalid/v1", "gpt-image-2")
+    runner = RelightRunner(
+        images,
+        tmp_path / "moli-uncertain",
+        1,
+        qwen,
+        config,
+        new_items=discover_images(images),
+        vision_client=vision,
+        generation_client=generation,
+    )
+    result = asyncio.run(runner.run())
+    failed = runner.state.rows({"failed"})
+    asyncio.run(runner.close())
+    assert result["counts"]["failed"] == 1
+    assert len(generation.calls) == 1
+    assert failed[0]["submission_started"] == 1
 
 
 def test_cli_returns_dedicated_circuit_exit_code(tmp_path: Path, monkeypatch) -> None:
@@ -504,9 +685,21 @@ def test_error_classifier_distinguishes_circuit_and_transient() -> None:
             "message": "no available channel for model_name: gpt-image-2",
         },
     )
-    assert unavailable.circuit_breaker is True
+    assert unavailable.category == "channel_temporarily_unavailable"
+    assert unavailable.circuit_breaker is False
     assert unavailable.stop_all_network is False
-    assert unavailable.retryable is False
+    assert unavailable.retryable is True
+
+    permanent = classify_toapis_error(
+        404,
+        {
+            "code": "model_not_found",
+            "message": "model not found: gpt-image-2",
+        },
+    )
+    assert permanent.category == "model_channel_unavailable"
+    assert permanent.circuit_breaker is True
+    assert permanent.retryable is False
 
     transient = classify_toapis_error(503, {"message": "temporary upstream error"})
     assert transient.retryable is True
@@ -515,6 +708,41 @@ def test_error_classifier_distinguishes_circuit_and_transient() -> None:
     auth = classify_toapis_error(401, {"message": "invalid api key"})
     assert auth.circuit_breaker is True
     assert auth.stop_all_network is True
+
+
+def test_attempt_adjustment_combines_related_fields_in_one_commit(
+    tmp_path: Path,
+) -> None:
+    """尝试计数与同一状态转换字段必须一次提交，同时保留立即持久化。"""
+
+    state = RelightState(tmp_path / "state.sqlite3")
+    state.add_items([("item-1", "a.jpg", "a.jpg")])
+    statements: list[str] = []
+    state.connection.set_trace_callback(statements.append)
+
+    attempts = state.increment_attempt(
+        "item-1",
+        "generation_attempts",
+        business_id="stable-business-id",
+    )
+    assert attempts == 1
+    assert sum(statement == "COMMIT" for statement in statements) == 1
+    row = state.get("item-1")
+    assert row["business_id"] == "stable-business-id"
+    assert row["error"] is None
+
+    statements.clear()
+    state.decrement_attempt(
+        "item-1",
+        "generation_attempts",
+        error="temporary failure",
+        submission_started=0,
+    )
+    assert sum(statement == "COMMIT" for statement in statements) == 1
+    row = state.get("item-1")
+    assert row["generation_attempts"] == 0
+    assert row["error"] == "temporary failure"
+    state.close()
 
 
 def test_legacy_state_database_adds_metadata_and_event_schema(tmp_path: Path) -> None:
@@ -630,6 +858,56 @@ class SubmitCircuitGenerationClient(FakeGenerationClient):
             category="model_channel_unavailable",
             circuit_breaker=True,
         )
+
+
+class SubmitTemporaryUnavailableClient(FakeGenerationClient):
+    """模拟ToAPIs暂时没有可用上游渠道。"""
+
+    async def submit_generation(
+        self, image_url: str, prompt: str, ratio: str, business_id: str
+    ) -> str:
+        del image_url, prompt, ratio
+        self.submit_calls.append(business_id)
+        raise RelightGenerationError(
+            "ToAPIs HTTP 503: no available distributor",
+            category="channel_temporarily_unavailable",
+            retryable=True,
+            http_status=503,
+        )
+
+
+def test_temporary_channel_outage_pauses_without_circuit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """连续503耗尽单图重试后保留selected状态，等待稍后续跑。"""
+
+    monkeypatch.setattr(env, "PROGRESS_ENABLED", False)
+
+    async def no_delay(_self, _attempts: int) -> None:
+        return None
+
+    monkeypatch.setattr(RelightRunner, "_retry_delay", no_delay)
+    images = _make_input(tmp_path)
+    item = discover_images(images)[0]
+    qwen, toapis = _configs()
+    generation = SubmitTemporaryUnavailableClient()
+    runner = RelightRunner(
+        images,
+        tmp_path / "temporary-channel-outage",
+        1,
+        qwen,
+        toapis,
+        new_items=[item],
+        vision_client=FakeVisionClient({"a.jpg": _decision(True)}),
+        generation_client=generation,
+    )
+    result = asyncio.run(runner.run())
+    row = runner.state.get(item[0])
+    asyncio.run(runner.close())
+    assert result["circuit_open"] is False
+    assert result["deferred_pending"] is True
+    assert row["stage"] == "selected"
+    assert len(generation.submit_calls) == env.RELIGHT_STAGE_MAX_ATTEMPTS
 
 
 def test_circuit_preserves_state_and_resume_does_not_repeat_vl_or_upload(

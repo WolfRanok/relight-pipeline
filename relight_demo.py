@@ -1,25 +1,26 @@
-"""Relight 保底链路入口：VL选图并调用可配置的ToAPIs图生图模型。"""
+"""Relight入口：VL选图并调用可配置的茉莉或ToAPIs生图渠道。"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import env
 from relight.config import (
     OssConfig,
     QwenConfig,
-    ToApisConfig,
+    load_generation_config,
     load_oss_config,
     load_qwen_config,
-    load_toapis_config,
     public_oss_config,
 )
 from relight.utils import write_json_atomic
 from relight.io import allocate_output_run, discover_images, validate_input_directory
 from relight.generator import generation_request_profile
+from relight.moli import moli_request_profile
 from relight.oss import RelightOssClient
 from relight.runner import RelightRunner
 
@@ -53,9 +54,20 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def _image_request_profile(
+    provider: str, model: str, resolution: str, quality: str
+) -> dict[str, str | bool]:
+    """返回不含凭据、可安全持久化的渠道请求语义。"""
+
+    if provider == "moli":
+        return moli_request_profile(model, resolution, quality)
+    profile = generation_request_profile(model, resolution, quality)
+    return {"provider": "toapis", **profile}
+
+
 def _load_resume(
     run_root: Path,
-) -> tuple[Path, str, int | None, str, str, str, str, str, dict]:
+) -> tuple[Path, str, int | None, str, str, str, str, str, dict, str]:
     config_path = run_root / ".pipeline" / "run_config.json"
     state_path = run_root / ".pipeline" / "state.sqlite3"
     if not config_path.is_file() or not state_path.is_file():
@@ -70,6 +82,10 @@ def _load_resume(
     # 旧Relight运行创建时只使用全局 gpt-image-2。缺少字段时按旧行为恢复，
     # 绝不能因后来修改 env.py 而在同一状态库中混用两种生图模型。
     image_model = str(payload.get("image_model") or "gpt-image-2")
+    # 引入多渠道前所有运行均由ToAPIs创建，缺失字段时不得随全局默认值改变。
+    image_provider = str(payload.get("image_provider") or "toapis")
+    if image_provider not in env.RELIGHT_IMAGE_PROVIDER_CHOICES:
+        raise ValueError(f"运行目录记录了未知生图渠道：{image_provider}")
     # 更早的Relight版本默认4K；新运行始终显式记录这些语义配置。
     resolution = str(payload.get("resolution") or "4k")
     request_profile = payload.get("image_request_profile") or {}
@@ -81,7 +97,7 @@ def _load_resume(
     oss_summary = payload.get("oss")
     if not isinstance(oss_summary, dict):
         oss_summary = {"enabled": False}
-    generation_request_profile(image_model, resolution, image_quality)
+    _image_request_profile(image_provider, image_model, resolution, image_quality)
     return (
         validated,
         dataset_name,
@@ -92,6 +108,7 @@ def _load_resume(
         prompt_version,
         vl_model,
         oss_summary,
+        image_provider,
     )
 
 
@@ -123,6 +140,7 @@ async def _run(args: argparse.Namespace) -> tuple[dict, Path]:
             prompt_version,
             vl_model,
             oss_summary,
+            image_provider,
         ) = _load_resume(run_root)
         # OSS是否启用属于本次运行的语义配置。续跑严格沿用运行目录记录，
         # 不受后来修改env.py开关的影响。
@@ -137,6 +155,7 @@ async def _run(args: argparse.Namespace) -> tuple[dict, Path]:
             raise RuntimeError("输入目录中没有JPG、PNG或WEBP图片")
         target_count = args.count
         image_model = env.RELIGHT_IMAGE_MODEL
+        image_provider = env.RELIGHT_IMAGE_PROVIDER
         resolution = env.RELIGHT_RESOLUTION
         image_quality = env.RELIGHT_IMAGE_QUALITY
         prompt_version = env.RELIGHT_PROMPT_VERSION
@@ -144,8 +163,8 @@ async def _run(args: argparse.Namespace) -> tuple[dict, Path]:
         if env.RELIGHT_OSS_ENABLED:
             # 在创建输出目录前完整校验外部配置，避免错误配置留下空运行。
             oss_config = load_oss_config()
-        request_profile = generation_request_profile(
-            image_model, resolution, image_quality
+        request_profile = _image_request_profile(
+            image_provider, image_model, resolution, image_quality
         )
         run_root = allocate_output_run(dataset_name)
         write_json_atomic(
@@ -161,6 +180,7 @@ async def _run(args: argparse.Namespace) -> tuple[dict, Path]:
                 "pair_validation_enabled": False,
                 "vl_model": vl_model,
                 "image_model": image_model,
+                "image_provider": image_provider,
                 "resolution": resolution,
                 "image_quality": image_quality,
                 "image_request_profile": request_profile,
@@ -179,20 +199,16 @@ async def _run(args: argparse.Namespace) -> tuple[dict, Path]:
         base_url=base_qwen.base_url,
         model=vl_model,
     )
-    base_toapis = load_toapis_config()
-    # 只覆盖 Relight 的模型名，凭据和服务地址仍复用现有安全配置。
-    relight_toapis = ToApisConfig(
-        api_key=base_toapis.api_key,
-        base_url=base_toapis.base_url,
-        model=image_model,
-    )
+    base_generation = load_generation_config(image_provider)
+    # 只覆盖运行目录锁定的模型名，凭据、地址与渠道均使用安全配置加载结果。
+    relight_generation = replace(base_generation, model=image_model)
     oss_client = RelightOssClient(oss_config) if oss_config is not None else None
     runner = RelightRunner(
         input_dir,
         run_root,
         target_count,
         qwen_config,
-        relight_toapis,
+        relight_generation,
         new_items=new_items,
         resolution=resolution,
         image_quality=image_quality,
