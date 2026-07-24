@@ -35,14 +35,31 @@ def _load_oss_sdk() -> Any:
         ) from exc
 
 
+def _unwrap_oss_error(exc: Exception, oss_sdk: Any) -> Exception:
+    """递归拆开SDK的OperationError，返回可读取状态码的底层异常。"""
+
+    current = exc
+    seen: set[int] = set()
+    while isinstance(current, oss_sdk.exceptions.OperationError):
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        nested = current.unwrap()
+        if not isinstance(nested, Exception):
+            break
+        current = nested
+    return current
+
+
 def _service_error(exc: Exception, operation: str) -> RelightGenerationError:
     """把 OSS SDK 异常转换为流水线可识别的重试/熔断错误。"""
 
     oss_sdk = _load_oss_sdk()
-    if isinstance(exc, oss_sdk.exceptions.ServiceError):
-        status = int(exc.status_code or 0)
-        code = str(exc.code or "")
-        message = str(exc.message or "OSS service error")
+    detail = _unwrap_oss_error(exc, oss_sdk)
+    if isinstance(detail, oss_sdk.exceptions.ServiceError):
+        status = int(detail.status_code or 0)
+        code = str(detail.code or "")
+        message = str(detail.message or "OSS service error")
         if status in {401, 402, 403}:
             return RelightGenerationError(
                 f"OSS {operation} authentication/account error: {message}",
@@ -65,14 +82,14 @@ def _service_error(exc: Exception, operation: str) -> RelightGenerationError:
             http_status=status or None,
             error_code=code or None,
         )
-    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+    if isinstance(detail, (TimeoutError, ConnectionError, OSError)):
         return RelightGenerationError(
-            f"OSS {operation} network error: {type(exc).__name__}: {exc}",
+            f"OSS {operation} network error: {type(detail).__name__}: {detail}",
             category="oss_transient",
             retryable=True,
         )
     return RelightGenerationError(
-        f"OSS {operation} failed: {type(exc).__name__}: {exc}",
+        f"OSS {operation} failed: {type(detail).__name__}: {detail}",
         category="oss_permanent",
     )
 
@@ -116,11 +133,15 @@ class RelightOssClient:
                 self._oss.HeadObjectRequest(bucket=self.config.bucket, key=key)
             )
             return True
-        except self._oss.exceptions.ServiceError as exc:
-            if int(exc.status_code or 0) == 404 or str(exc.code or "") in {
+        except self._oss.exceptions.BaseError as exc:
+            detail = _unwrap_oss_error(exc, self._oss)
+            if isinstance(detail, self._oss.exceptions.ServiceError) and (
+                int(detail.status_code or 0) == 404
+                or str(detail.code or "") in {
                 "NoSuchKey",
                 "NoSuchObject",
-            }:
+                }
+            ):
                 return False
             raise
 
@@ -144,9 +165,13 @@ class RelightOssClient:
                 return
             try:
                 self._upload_file(key, source, forbid_overwrite=True)
-            except self._oss.exceptions.ServiceError as exc:
+            except self._oss.exceptions.BaseError as exc:
+                detail = _unwrap_oss_error(exc, self._oss)
                 # 并发任务可能同时发现对象不存在，后到者的409可安全视为命中。
-                if int(exc.status_code or 0) != 409:
+                if not (
+                    isinstance(detail, self._oss.exceptions.ServiceError)
+                    and int(detail.status_code or 0) == 409
+                ):
                     raise
 
         try:

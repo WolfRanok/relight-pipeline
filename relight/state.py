@@ -123,6 +123,22 @@ class RelightState:
         self.connection.commit()
         return int(cursor.rowcount)
 
+    def recover_oss_cache_miss_failures(self) -> int:
+        """恢复旧版本把OSS首次HEAD 404误判为永久失败的未提交任务。"""
+
+        cursor = self.connection.execute(
+            "UPDATE relight_items SET stage='selected',generation_attempts=0,"
+            "result_json=NULL,error=NULL,updated_at=? "
+            "WHERE stage='failed' AND selection_json IS NOT NULL "
+            "AND task_id IS NULL AND submission_started=0 "
+            "AND oss_input_key IS NULL AND error LIKE '%OSS input upload failed%' "
+            "AND (error LIKE '%Http Status Code: 404%' "
+            "OR error LIKE '%NoSuchKey%')",
+            (_now(),),
+        )
+        self.connection.commit()
+        return int(cursor.rowcount)
+
     def add_items(self, items: Iterable[tuple[str, str, str]]) -> None:
         self.connection.executemany(
             "INSERT OR IGNORE INTO relight_items"

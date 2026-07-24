@@ -11,6 +11,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -589,6 +590,36 @@ def test_legacy_invalid_json_failure_is_reopened_for_resume(tmp_path: Path) -> N
     state.close()
 
 
+def test_legacy_oss_head_404_failure_is_reopened_for_resume(tmp_path: Path) -> None:
+    """OSS缓存未命中的旧误判可恢复，但已提交任务绝不被该迁移修改。"""
+
+    state = RelightState(tmp_path / "state.sqlite3")
+    state.add_items([
+        ("safe-item", "a.jpg", "a.jpg"),
+        ("submitted-item", "b.jpg", "b.jpg"),
+    ])
+    for item_id, submitted in (("safe-item", 0), ("submitted-item", 1)):
+        state.save_json(
+            item_id,
+            "selection_json",
+            _decision(True).to_dict(),
+            stage="failed",
+            business_id=f"business-{item_id}",
+            submission_started=submitted,
+            generation_attempts=1,
+            result_json=json.dumps({"failure_stage": "image_generation"}),
+            error=(
+                "RelightGenerationError: OSS input upload failed: OperationError "
+                "Http Status Code: 404. Error Code: NoSuchKey."
+            ),
+        )
+    assert state.recover_oss_cache_miss_failures() == 1
+    assert state.get("safe-item")["stage"] == "selected"
+    assert state.get("safe-item")["generation_attempts"] == 0
+    assert state.get("submitted-item")["stage"] == "failed"
+    state.close()
+
+
 class SubmitCircuitGenerationClient(FakeGenerationClient):
     async def submit_generation(
         self, image_url: str, prompt: str, ratio: str, business_id: str
@@ -1120,6 +1151,59 @@ def test_oss_sdk_is_optional_until_oss_client_is_created(monkeypatch) -> None:
     )
     with pytest.raises(RuntimeError, match=r"pip install -e .*\[oss\]"):
         relight_oss_module.RelightOssClient(config)
+
+
+def test_oss_operation_error_unwraps_service_404_and_transient(monkeypatch) -> None:
+    """SDK用OperationError包装404/5xx时仍能识别缓存未命中与临时错误。"""
+
+    class BaseError(Exception):
+        pass
+
+    class ServiceError(BaseError):
+        def __init__(self, status_code: int, code: str, message: str) -> None:
+            super().__init__(message)
+            self.status_code = status_code
+            self.code = code
+            self.message = message
+
+    class OperationError(BaseError):
+        def __init__(self, detail: Exception) -> None:
+            super().__init__(str(detail))
+            self.detail = detail
+
+        def unwrap(self) -> Exception:
+            return self.detail
+
+    fake_sdk = SimpleNamespace(
+        exceptions=SimpleNamespace(
+            BaseError=BaseError,
+            ServiceError=ServiceError,
+            OperationError=OperationError,
+        )
+    )
+
+    class MissingObjectClient:
+        def head_object(self, _request) -> None:
+            raise OperationError(ServiceError(404, "NoSuchKey", "missing"))
+
+    fake_sdk.HeadObjectRequest = lambda **kwargs: kwargs
+    config = OssConfig(
+        "id", "secret", "bucket", "https://oss-cn-hangzhou.aliyuncs.com",
+        "cn-hangzhou", "prefix", 3600, 10,
+    )
+    client = object.__new__(relight_oss_module.RelightOssClient)
+    client.config = config
+    client._oss = fake_sdk
+    client.client = MissingObjectClient()
+    assert client._exists("missing-key") is False
+
+    monkeypatch.setattr(relight_oss_module, "_load_oss_sdk", lambda: fake_sdk)
+    converted = relight_oss_module._service_error(
+        OperationError(ServiceError(503, "ServiceUnavailable", "temporary")),
+        "test",
+    )
+    assert converted.retryable is True
+    assert converted.category == "oss_transient"
 
 
 def test_resume_oss_identity_must_match_recorded_run() -> None:

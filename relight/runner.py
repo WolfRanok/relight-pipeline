@@ -653,6 +653,14 @@ class RelightRunner:
                 f"恢复{recovered}个可继续查询的旧版误判任务",
                 None,
             )
+        oss_recovered = self.state.recover_oss_cache_miss_failures()
+        if oss_recovered:
+            self.state.add_event(
+                "legacy_failures_recovered",
+                "oss_cache_miss",
+                f"恢复{oss_recovered}个被OSS HEAD 404误判的未提交任务",
+                None,
+            )
         full_scan = self.target_count is None
         completed = self.state.completed_count()
         failed_total = self.state.counts().get("failed", 0)
