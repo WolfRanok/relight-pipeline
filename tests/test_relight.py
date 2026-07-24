@@ -466,6 +466,7 @@ def test_resume_recovers_existing_business_task_without_submit(tmp_path: Path, m
         item_id, "selection_json", _decision(True).to_dict(), stage="selected",
         source_sha256="known-hash", upload_url="https://upload.invalid/a.jpg",
         business_id=business_id,
+        submission_started=1,
     )
     asyncio.run(runner.close())
 
@@ -536,7 +537,7 @@ def test_legacy_state_database_adds_metadata_and_event_schema(tmp_path: Path) ->
     state.add_event("circuit_opened", "test", "safe error", None)
     assert {
         "width", "height", "image_format", "aspect_ratio",
-        "oss_input_key", "oss_output_prefix",
+        "oss_input_key", "oss_output_prefix", "submission_started",
     } <= columns
     assert state.events()[0]["category"] == "test"
     first_run_id = state.run_id()
@@ -570,6 +571,7 @@ def test_legacy_invalid_json_failure_is_reopened_for_resume(tmp_path: Path) -> N
     assert row["stage"] == "selected"
     assert row["generation_attempts"] == 0
     assert row["business_id"] == "legacy-business-id"
+    assert row["submission_started"] == 1
     assert row["result_json"] is None
     state.close()
 
@@ -804,6 +806,19 @@ def test_ambiguous_query_failure_is_deferred_instead_of_terminal(
         vision_client=FakeVisionClient({"a.jpg": _decision(True)}),
         generation_client=generation,
     )
+    runner.state.save_json(
+        item[0],
+        "selection_json",
+        _decision(True).to_dict(),
+        stage="selected",
+        source_sha256="known-hash",
+        width=120,
+        height=80,
+        image_format="JPEG",
+        aspect_ratio="3:2",
+        business_id="ambiguous-business-id",
+        submission_started=1,
+    )
     result = asyncio.run(runner.run())
     row = runner.state.get(item[0])
     asyncio.run(runner.close())
@@ -814,6 +829,35 @@ def test_ambiguous_query_failure_is_deferred_instead_of_terminal(
     assert row["generation_attempts"] == env.RELIGHT_STAGE_MAX_ATTEMPTS - 1
     assert generation.upload_calls == []
     assert generation.submit_calls == []
+
+
+def test_fresh_business_id_skips_broken_missing_task_lookup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """从未提交的新任务直接进入上传，避免查询不存在ID触发服务端panic。"""
+
+    monkeypatch.setattr(env, "PROGRESS_ENABLED", False)
+    images = _make_input(tmp_path)
+    item = discover_images(images)[0]
+    qwen, toapis = _configs()
+    generation = QueryErrorGenerationClient()
+    runner = RelightRunner(
+        images,
+        tmp_path / "run",
+        1,
+        qwen,
+        toapis,
+        new_items=[item],
+        vision_client=FakeVisionClient({"a.jpg": _decision(True)}),
+        generation_client=generation,
+    )
+    result = asyncio.run(runner.run())
+    row = runner.state.get(item[0])
+    asyncio.run(runner.close())
+    assert result["completed"] == 1
+    assert generation.query_calls == []
+    assert len(generation.submit_calls) == 1
+    assert row["submission_started"] == 1
 
 
 def test_pending_remote_timeout_remains_resumable(

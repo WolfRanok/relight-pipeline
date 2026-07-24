@@ -450,17 +450,22 @@ class RelightRunner:
                     self.state.update(item_id, business_id=business_id)
 
                 async with self.remote_generation_semaphore:
-                    task_id = self.state.get(item_id).get("task_id")
+                    persisted = self.state.get(item_id)
+                    task_id = persisted.get("task_id")
                     if not task_id:
                         if self.circuit_event.is_set() or self.deferred_event.is_set():
                             self.state.decrement_attempt(
                                 item_id, "generation_attempts"
                             )
                             return "selected"
-                        async with self.poll_semaphore:
-                            existing = await self.generator.query_task(
-                                str(business_id), allow_missing=True
-                            )
+                        existing = None
+                        if bool(persisted.get("submission_started")):
+                            # 只有请求可能已经发出时才按业务ID查重。全新ID尚未
+                            # 提交，ToAPIs会错误返回new_api_panic而不是404。
+                            async with self.poll_semaphore:
+                                existing = await self.generator.query_task(
+                                    str(business_id), allow_missing=True
+                                )
                         if existing:
                             task_id = str(existing.get("id") or business_id)
                         else:
@@ -493,6 +498,9 @@ class RelightRunner:
                                         item_id, "generation_attempts"
                                     )
                                     return "selected"
+                                # 在发出可能产生费用的请求之前先落盘。即使进程在
+                                # 响应返回前退出，续跑也会先查重而不是重复提交。
+                                self.state.update(item_id, submission_started=1)
                                 task_id = await self.generator.submit_generation(
                                     str(upload_url),
                                     build_generation_prompt(

@@ -43,6 +43,7 @@ class RelightState:
                 oss_input_key TEXT,
                 oss_output_prefix TEXT,
                 business_id TEXT,
+                submission_started INTEGER NOT NULL DEFAULT 0,
                 task_id TEXT,
                 result_json TEXT,
                 error TEXT,
@@ -62,6 +63,7 @@ class RelightState:
             ("aspect_ratio", "TEXT"),
             ("oss_input_key", "TEXT"),
             ("oss_output_prefix", "TEXT"),
+            ("submission_started", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if name not in columns:
                 self.connection.execute(
@@ -112,7 +114,7 @@ class RelightState:
 
         cursor = self.connection.execute(
             "UPDATE relight_items SET stage='selected',generation_attempts=0,"
-            "result_json=NULL,error=NULL,updated_at=? "
+            "submission_started=1,result_json=NULL,error=NULL,updated_at=? "
             "WHERE stage='failed' AND selection_json IS NOT NULL "
             "AND business_id IS NOT NULL "
             "AND error LIKE '%HTTP 200返回非JSON响应%'",
