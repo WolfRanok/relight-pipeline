@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+data/
+output/
+*.part
+*.sqlite3
+*.log
+APIKEY.txt
+TOAPIS_APIKEY.txt
+OSS_CONFIG.local.md
+MODEL_CONFIG.local.md
