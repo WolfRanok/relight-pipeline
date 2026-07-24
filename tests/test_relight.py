@@ -38,6 +38,7 @@ from relight.runner import RelightRunner
 from relight.state import RelightState
 import relight.runner as relight_runner_module
 import relight.io as relight_io_module
+import relight.oss as relight_oss_module
 import relight_demo as relight_demo_module
 from relight.vl import RelightDecision, validate_relight_response
 from relight_demo import _load_resume, _validate_resume_oss_config, parse_args
@@ -1089,6 +1090,36 @@ def test_oss_markdown_config_and_public_summary_exclude_credentials(
     assert "access_key_id" not in summary
     assert "access_key_secret" not in summary
     assert "test-secret" not in json.dumps(summary)
+
+
+def test_oss_sdk_is_optional_until_oss_client_is_created(monkeypatch) -> None:
+    """OSS关闭时导入主程序不依赖SDK，启用时给出明确安装命令。"""
+
+    real_import = relight_oss_module.importlib.import_module
+
+    def missing_oss_sdk(name: str):
+        if name == "alibabacloud_oss_v2":
+            raise ModuleNotFoundError(
+                "No module named 'alibabacloud_oss_v2'",
+                name="alibabacloud_oss_v2",
+            )
+        return real_import(name)
+
+    monkeypatch.setattr(
+        relight_oss_module.importlib, "import_module", missing_oss_sdk
+    )
+    config = OssConfig(
+        "id",
+        "secret",
+        "bucket",
+        "https://oss-cn-hangzhou.aliyuncs.com",
+        "cn-hangzhou",
+        "prefix",
+        3600,
+        10,
+    )
+    with pytest.raises(RuntimeError, match=r"pip install -e .*\[oss\]"):
+        relight_oss_module.RelightOssClient(config)
 
 
 def test_resume_oss_identity_must_match_recorded_run() -> None:

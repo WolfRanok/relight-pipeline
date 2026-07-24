@@ -12,6 +12,26 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+`.venv`是每台机器独立创建的运行环境，按Python项目惯例不会上传GitHub；
+第三方依赖由`requirements.txt`或`pyproject.toml`声明并自动安装。其他项目也可
+直接安装本仓库的核心功能：
+
+```powershell
+pip install -e .
+```
+
+需要OSS功能时安装可选依赖：
+
+```powershell
+pip install -e ".[oss]"
+```
+
+需要运行测试时安装开发依赖：
+
+```powershell
+pip install -e ".[dev,oss]"
+```
+
 Qwen密钥保存在`APIKEY.txt`，ToAPIs密钥保存在`TOAPIS_APIKEY.txt`，每个文件只放一行Key。也可以使用`DASHSCOPE_API_KEY`和`TOAPIS_API_KEY`环境变量临时覆盖。密钥不会进入运行结果。
 
 ## 使用
@@ -54,6 +74,9 @@ output/YYYY-MM-DD/数据集名称_编号/
 ## OSS选项
 
 `env.py`中的`RELIGHT_OSS_ENABLED`默认是`False`。改为`True`后，源图按SHA-256缓存到私有OSS，生图服务使用短期签名URL，成功交付物同时同步到OSS和本地。OSS参数默认读取项目根目录下被Git忽略的`OSS_CONFIG.local.md`，环境变量优先。
+
+阿里云OSS官方SDK是可选依赖：OSS关闭时不会加载；OSS开启但未安装SDK时，
+程序会提示执行`pip install -e ".[oss]"`，不会再因模块顶层导入而直接启动失败。
 
 ## 调度和错误恢复
 

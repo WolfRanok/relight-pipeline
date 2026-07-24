@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import mimetypes
 import uuid
 from datetime import timedelta
@@ -15,16 +16,30 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import aiohttp
-import alibabacloud_oss_v2 as oss
 
 from relight.config import OssConfig, public_oss_config
 from relight.generator import RelightGenerationError
 
 
+def _load_oss_sdk() -> Any:
+    """仅在启用OSS时加载官方SDK，并给出可执行的缺依赖提示。"""
+
+    try:
+        return importlib.import_module("alibabacloud_oss_v2")
+    except ModuleNotFoundError as exc:
+        if exc.name != "alibabacloud_oss_v2":
+            raise
+        raise RuntimeError(
+            "已启用OSS但未安装阿里云SDK；请执行 "
+            "pip install -e \".[oss]\" 或 pip install -r requirements.txt"
+        ) from exc
+
+
 def _service_error(exc: Exception, operation: str) -> RelightGenerationError:
     """把 OSS SDK 异常转换为流水线可识别的重试/熔断错误。"""
 
-    if isinstance(exc, oss.exceptions.ServiceError):
+    oss_sdk = _load_oss_sdk()
+    if isinstance(exc, oss_sdk.exceptions.ServiceError):
         status = int(exc.status_code or 0)
         code = str(exc.code or "")
         message = str(exc.message or "OSS service error")
@@ -67,13 +82,14 @@ class RelightOssClient:
 
     def __init__(self, config: OssConfig) -> None:
         self.config = config
-        sdk_config = oss.config.load_default()
-        sdk_config.credentials_provider = oss.credentials.StaticCredentialsProvider(
+        self._oss = _load_oss_sdk()
+        sdk_config = self._oss.config.load_default()
+        sdk_config.credentials_provider = self._oss.credentials.StaticCredentialsProvider(
             config.access_key_id, config.access_key_secret
         )
         sdk_config.region = config.region
         sdk_config.endpoint = config.endpoint
-        self.client = oss.Client(sdk_config)
+        self.client = self._oss.Client(sdk_config)
         self.semaphore = asyncio.Semaphore(config.concurrency)
 
     @property
@@ -97,10 +113,10 @@ class RelightOssClient:
     def _exists(self, key: str) -> bool:
         try:
             self.client.head_object(
-                oss.HeadObjectRequest(bucket=self.config.bucket, key=key)
+                self._oss.HeadObjectRequest(bucket=self.config.bucket, key=key)
             )
             return True
-        except oss.exceptions.ServiceError as exc:
+        except self._oss.exceptions.ServiceError as exc:
             if int(exc.status_code or 0) == 404 or str(exc.code or "") in {
                 "NoSuchKey",
                 "NoSuchObject",
@@ -110,7 +126,7 @@ class RelightOssClient:
 
     def _upload_file(self, key: str, path: Path, *, forbid_overwrite: bool) -> None:
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        request = oss.PutObjectRequest(
+        request = self._oss.PutObjectRequest(
             bucket=self.config.bucket,
             key=key,
             content_type=content_type,
@@ -128,7 +144,7 @@ class RelightOssClient:
                 return
             try:
                 self._upload_file(key, source, forbid_overwrite=True)
-            except oss.exceptions.ServiceError as exc:
+            except self._oss.exceptions.ServiceError as exc:
                 # 并发任务可能同时发现对象不存在，后到者的409可安全视为命中。
                 if int(exc.status_code or 0) != 409:
                     raise
@@ -145,7 +161,7 @@ class RelightOssClient:
 
         def presign() -> str:
             result = self.client.presign(
-                oss.GetObjectRequest(bucket=self.config.bucket, key=key),
+                self._oss.GetObjectRequest(bucket=self.config.bucket, key=key),
                 expires=timedelta(seconds=self.config.presign_seconds),
             )
             return str(result.url)
@@ -159,7 +175,7 @@ class RelightOssClient:
     async def _copy(self, source_key: str, destination_key: str) -> None:
         def copy() -> None:
             self.client.copy_object(
-                oss.CopyObjectRequest(
+                self._oss.CopyObjectRequest(
                     bucket=self.config.bucket,
                     key=destination_key,
                     source_bucket=self.config.bucket,
@@ -221,7 +237,7 @@ class RelightOssClient:
             async with self.semaphore:
                 await asyncio.to_thread(
                     self.client.put_object,
-                    oss.PutObjectRequest(
+                    self._oss.PutObjectRequest(
                         bucket=self.config.bucket,
                         key=key,
                         content_type="text/plain",
@@ -247,7 +263,7 @@ class RelightOssClient:
             async with self.semaphore:
                 await asyncio.to_thread(
                     self.client.delete_object,
-                    oss.DeleteObjectRequest(bucket=self.config.bucket, key=key),
+                    self._oss.DeleteObjectRequest(bucket=self.config.bucket, key=key),
                 )
             deleted = True
         return {
