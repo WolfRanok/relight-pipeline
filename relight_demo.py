@@ -67,7 +67,7 @@ def _image_request_profile(
 
 def _load_resume(
     run_root: Path,
-) -> tuple[Path, str, int | None, str, str, str, str, str, dict, str]:
+) -> tuple[Path, str, int | None, str, str, str, str, dict, str]:
     config_path = run_root / ".pipeline" / "run_config.json"
     state_path = run_root / ".pipeline" / "state.sqlite3"
     if not config_path.is_file() or not state_path.is_file():
@@ -92,7 +92,6 @@ def _load_resume(
     image_quality = str(
         payload.get("image_quality") or request_profile.get("quality") or "high"
     )
-    prompt_version = str(payload.get("prompt_version") or "relight-natural-visible-v1")
     vl_model = str(payload.get("vl_model") or "qwen3-vl-plus")
     oss_summary = payload.get("oss")
     if not isinstance(oss_summary, dict):
@@ -105,7 +104,6 @@ def _load_resume(
         image_model,
         resolution,
         image_quality,
-        prompt_version,
         vl_model,
         oss_summary,
         image_provider,
@@ -137,7 +135,6 @@ async def _run(args: argparse.Namespace) -> tuple[dict, Path]:
             image_model,
             resolution,
             image_quality,
-            prompt_version,
             vl_model,
             oss_summary,
             image_provider,
@@ -158,7 +155,6 @@ async def _run(args: argparse.Namespace) -> tuple[dict, Path]:
         image_provider = env.RELIGHT_IMAGE_PROVIDER
         resolution = env.RELIGHT_RESOLUTION
         image_quality = env.RELIGHT_IMAGE_QUALITY
-        prompt_version = env.RELIGHT_PROMPT_VERSION
         vl_model = env.RELIGHT_VL_MODEL
         if env.RELIGHT_OSS_ENABLED:
             # 在创建输出目录前完整校验外部配置，避免错误配置留下空运行。
@@ -184,7 +180,6 @@ async def _run(args: argparse.Namespace) -> tuple[dict, Path]:
                 "resolution": resolution,
                 "image_quality": image_quality,
                 "image_request_profile": request_profile,
-                "prompt_version": prompt_version,
                 "oss": (
                     public_oss_config(oss_config)
                     if oss_config is not None
@@ -212,7 +207,6 @@ async def _run(args: argparse.Namespace) -> tuple[dict, Path]:
         new_items=new_items,
         resolution=resolution,
         image_quality=image_quality,
-        prompt_version=prompt_version,
         oss_client=oss_client,
     )
     try:

@@ -69,7 +69,6 @@ class RelightRunner:
         generation_client: Any | None = None,
         resolution: str | None = None,
         image_quality: str | None = None,
-        prompt_version: str | None = None,
         oss_client: Any | None = None,
     ) -> None:
         self.input_dir = input_dir.resolve()
@@ -91,7 +90,6 @@ class RelightRunner:
         self.image_provider = getattr(toapis_config, "provider", "toapis")
         self.resolution = resolution or env.RELIGHT_RESOLUTION
         self.image_quality = image_quality or env.RELIGHT_IMAGE_QUALITY
-        self.prompt_version = prompt_version or env.RELIGHT_PROMPT_VERSION
         self.vision = vision_client or RelightVisionClient(qwen_config)
         if generation_client is not None:
             self.generator = generation_client
@@ -127,7 +125,6 @@ class RelightRunner:
         self.encode_semaphore = asyncio.Semaphore(env.RELIGHT_ENCODE_CONCURRENCY)
         self.circuit_event = asyncio.Event()
         self.stop_network_event = asyncio.Event()
-        self.deferred_event = asyncio.Event()
         self.circuit_lock = asyncio.Lock()
         self.circuit_info: dict[str, Any] | None = None
         # 旧运行目录不主动迁移；新的“图片/提示词”交付结构只用于后续结果。
@@ -283,6 +280,7 @@ class RelightRunner:
         row: dict[str, Any],
         selection: dict[str, Any],
         error: str,
+        **state_fields: Any,
     ) -> str:
         failure = {
             "image_id": item_id,
@@ -295,7 +293,12 @@ class RelightRunner:
             "task_id": row.get("task_id"),
         }
         self.state.save_json(
-            item_id, "result_json", failure, stage="failed", error=error
+            item_id,
+            "result_json",
+            failure,
+            stage="failed",
+            error=error,
+            **state_fields,
         )
         return "failed"
 
@@ -314,7 +317,7 @@ class RelightRunner:
                 "茉莉同步任务曾开始提交但没有可恢复结果，已禁止自动重提",
                 category="ambiguous_submission",
             )
-        if self.circuit_event.is_set() or self.deferred_event.is_set():
+        if self.circuit_event.is_set():
             self.state.decrement_attempt(item_id, "generation_attempts")
             return None
         # OSS在茉莉模式下只缓存输入和发布交付物；模型仍直接上传本地源图。
@@ -348,7 +351,7 @@ class RelightRunner:
         task_id = row.get("task_id")
         if task_id:
             return str(task_id)
-        if self.circuit_event.is_set() or self.deferred_event.is_set():
+        if self.circuit_event.is_set():
             self.state.decrement_attempt(item_id, "generation_attempts")
             return None
 
@@ -381,7 +384,7 @@ class RelightRunner:
                     row["upload_url"] = upload_url
 
             async with self.submit_semaphore:
-                if self.circuit_event.is_set() or self.deferred_event.is_set():
+                if self.circuit_event.is_set():
                     self.state.decrement_attempt(item_id, "generation_attempts")
                     return None
                 # 在可能计费前先落盘；响应丢失后续跑会按业务ID查重。
@@ -458,7 +461,6 @@ class RelightRunner:
             "image_provider": self.image_provider,
             "resolution": self.resolution,
             "image_request_profile": self._image_request_profile(),
-            "prompt_version": self.prompt_version,
             "business_id": current.get("business_id"),
             "task_id": current.get("task_id"),
             "status": "completed",
@@ -499,7 +501,8 @@ class RelightRunner:
             row = self.state.get(item_id)
             if row["stage"] != "pending" or self.circuit_event.is_set():
                 return str(row["stage"])
-            if int(row["vl_attempts"]) >= env.RELIGHT_STAGE_MAX_ATTEMPTS:
+            attempt_limit = env.RELIGHT_STAGE_MAX_RETRIES + 1
+            if int(row["vl_attempts"]) >= attempt_limit:
                 self.state.update(
                     item_id,
                     stage="failed",
@@ -524,7 +527,6 @@ class RelightRunner:
                     "source_sha256": prepared.sha256,
                     "selection": selection,
                     "vl_model": self.qwen_config.model,
-                    "prompt_version": self.prompt_version,
                 }
                 if decision.decision == "skip":
                     self.state.save_json(
@@ -570,7 +572,7 @@ class RelightRunner:
                     await self._open_circuit(item_id, circuit_error)
                     return "pending"
                 error = f"{type(exc).__name__}: {exc}"
-                if attempts >= env.RELIGHT_STAGE_MAX_ATTEMPTS:
+                if attempts >= attempt_limit:
                     failure = {
                         "image_id": item_id,
                         "source_path": row["source_path"],
@@ -590,16 +592,19 @@ class RelightRunner:
             row = self.state.get(item_id)
             if row["stage"] != "selected":
                 return str(row["stage"])
-            already_submitted = bool(row.get("task_id")) or (
-                self.image_provider == "moli" and bool(row.get("submission_started"))
+            already_submitted = bool(
+                row.get("task_id") or row.get("submission_started")
             )
             # 熔断后仅允许已经提交并持久化task_id的付费任务继续收尾。
             if self.stop_network_event.is_set() or (
-                (self.circuit_event.is_set() or self.deferred_event.is_set())
-                and not already_submitted
+                self.circuit_event.is_set() and not already_submitted
             ):
                 return "selected"
-            if int(row["generation_attempts"]) >= env.RELIGHT_STAGE_MAX_ATTEMPTS:
+            attempt_limit = env.RELIGHT_STAGE_MAX_RETRIES + 1
+            if (
+                int(row["generation_attempts"]) >= attempt_limit
+                and not already_submitted
+            ):
                 selection = json.loads(row["selection_json"] or "{}")
                 return self._fail_generation(
                     item_id,
@@ -642,6 +647,8 @@ class RelightRunner:
                 )
                 # 尝试次数和确定性业务ID属于同一个本地状态转换，一次提交即可；
                 # 它们仍然会在任何外部生图请求之前完成持久化。
+                # 查询已持久化任务不会重复创建付费任务，但仍记录本次处理尝试，
+                # 从而在查询本身失败时遵守“零次重试”的运行策略。
                 attempts = self.state.increment_attempt(
                     item_id, "generation_attempts", business_id=business_id
                 )
@@ -695,13 +702,15 @@ class RelightRunner:
             except asyncio.CancelledError:
                 raise
             except RelightTaskPendingTimeout as exc:
-                # 远端尚未终态，不能判失败或释放后继续超额提交新任务。
+                # 用户选择单图超过轮询窗口即失败；任务ID仍写入失败记录供审计。
                 self._cleanup_pair(row)
-                self.state.decrement_attempt(
-                    item_id, "generation_attempts", error=str(exc)
+                current = self.state.get(item_id)
+                return self._fail_generation(
+                    item_id,
+                    current,
+                    selection,
+                    f"{type(exc).__name__}: {exc}",
                 )
-                self.deferred_event.set()
-                return "deferred"
             except RelightNetworkStopped:
                 self._cleanup_pair(row)
                 self.state.decrement_attempt(item_id, "generation_attempts")
@@ -738,21 +747,17 @@ class RelightRunner:
                     retry_fields = {"submission_started": 0}
                 else:
                     retry_fields = {}
-                if not retryable:
+                if (
+                    not retryable
+                    or int(current["generation_attempts"]) >= attempt_limit
+                ):
                     return self._fail_generation(
-                        item_id, current, selection, error
-                    )
-                if int(current["generation_attempts"]) >= env.RELIGHT_STAGE_MAX_ATTEMPTS:
-                    # 查询、提交超时或响应损坏时，远端可能已经创建付费任务。
-                    # 保留selected与业务/任务ID，停止本轮并让--resume继续核对。
-                    self.state.decrement_attempt(
                         item_id,
-                        "generation_attempts",
-                        error=error,
+                        current,
+                        selection,
+                        error,
                         **retry_fields,
                     )
-                    self.deferred_event.set()
-                    return "deferred"
                 self.state.update(item_id, error=error, **retry_fields)
                 if (
                     isinstance(exc, RelightGenerationError)
@@ -826,7 +831,7 @@ class RelightRunner:
         # 没有批次屏障；工作池容量由既有VL和生图并发自动推导。
         # 真正的API请求由各阶段Semaphore分别严格限制。
         pipeline_capacity = max(
-            1, env.RELIGHT_VL_CONCURRENCY + env.RELIGHT_GENERATION_CONCURRENCY
+            1, env.RELIGHT_VL_CONCURRENCY + self.remote_generation_limit
         )
         running: dict[asyncio.Task[str], str] = {}
 
@@ -835,7 +840,7 @@ class RelightRunner:
 
             while len(running) < pipeline_capacity:
                 row: dict[str, Any] | None = None
-                if self.stop_network_event.is_set() or self.deferred_event.is_set():
+                if self.stop_network_event.is_set():
                     break
                 if submitted_rows:
                     # 即使模型提交渠道已熔断，已付费任务仍应优先收尾。
@@ -897,23 +902,21 @@ class RelightRunner:
             self.export_reports()
         active_left = len(self.state.rows(ACTIVE_STAGES))
         circuit_open = self.circuit_event.is_set()
-        deferred_pending = self.deferred_event.is_set()
         return {
             "mode": "all" if full_scan else "target_count",
             "target": self.target_count,
             "completed": completed,
             "quota_consumed": quota_consumed if not full_scan else None,
             "target_reached": (
-                active_left == 0 and not circuit_open and not deferred_pending
+                active_left == 0 and not circuit_open
                 if full_scan
                 else quota_consumed >= self.target_count
                 and not circuit_open
-                and not deferred_pending
             ),
             "active_remaining": active_left,
             "circuit_open": circuit_open,
             "circuit": self.circuit_info,
-            "deferred_pending": deferred_pending,
+            "deferred_pending": False,
             "resume_command": f'python relight_demo.py --resume "{self.run_root}"',
             "counts": self.state.counts(),
         }
@@ -958,7 +961,6 @@ class RelightRunner:
                 "resolution": self.resolution,
                 "image_provider": self.image_provider,
                 "image_request_profile": self._image_request_profile(),
-                "prompt_version": self.prompt_version,
                 "oss": (
                     self.oss.public_config
                     if self.oss is not None
@@ -966,7 +968,7 @@ class RelightRunner:
                 ),
                 "circuit_open": self.circuit_event.is_set(),
                 "circuit": self.circuit_info,
-                "deferred_pending": self.deferred_event.is_set(),
+                "deferred_pending": False,
                 "active_remaining": len(self.state.rows(ACTIVE_STAGES)),
                 "resume_command": f'python relight_demo.py --resume "{self.run_root}"',
                 "runtime_concurrency": {

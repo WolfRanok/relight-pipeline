@@ -46,6 +46,10 @@ from relight.moli import (
     moli_2k_size,
     validate_moli_2k,
 )
+from relight.prompts import (
+    SELECTION_PROMPT,
+    build_generation_prompt,
+)
 from relight.runner import RelightRunner
 from relight.state import RelightState
 import relight.runner as relight_runner_module
@@ -66,19 +70,51 @@ def _decision(use: bool) -> RelightDecision:
         return RelightDecision(
             "use",
             "主体明确的室内摄影",
-            "left",
-            "warm",
-            "soft",
-            "window_light",
-            "使用来自左侧、方向清晰的柔和暖光为不变的场景重新打光。",
-            "Relight the scene with clearly directional warm window light from the left.",
+            "重新设计现有场景的照明，使主体与环境形成清楚而自然的新明暗关系。",
+            "Redesign the existing scene illumination with a clear, natural new relationship between the subject and its environment.",
             "画面结构稳定，适合明显但自然的重打光。",
             0.95,
         )
     return RelightDecision(
-        "skip", "无法稳定重打光的画面", None, None, None, None,
-        "", "", "光照不可控。", 0.9
+        "skip", "无法稳定重打光的画面", "", "", "光照不可控。", 0.9
     )
+
+
+def test_selection_prompt_has_no_direction_or_style_anchors() -> None:
+    """VL提示词不得提供固定方向、风格枚举或具体方案模板。"""
+
+    for anchored_value in (
+        "lighting_direction",
+        "color_temperature",
+        "light_quality",
+        "lighting_style",
+        "left",
+        "right",
+        "window_light",
+        "golden_hour",
+        "左侧",
+        "右侧",
+    ):
+        assert anchored_value not in SELECTION_PROMPT
+    assert "不要从固定方向、固定风格或常用模板中挑选答案" in SELECTION_PROMPT
+    assert "正常观看尺寸" in SELECTION_PROMPT
+    assert "不要求一定改变光源方向" in SELECTION_PROMPT
+    assert "时间或天气氛围只能通过现有场景的照明" in SELECTION_PROMPT
+    assert "不得改变天空结构、天气元素或其他场景内容" in SELECTION_PROMPT
+
+
+def test_generation_prompt_preserves_scene_without_direction_anchors() -> None:
+    """生图包装应统一解释空间方向，但不得再次注入具体方向示例。"""
+
+    edit = "Create a clearly different but natural illumination for the existing scene."
+    prompt = build_generation_prompt(edit)
+    assert "Visibility requirements:" in prompt
+    assert "Spatial interpretation:" in prompt
+    assert "using image and camera coordinates" in prompt
+    assert "weather atmosphere may be expressed only through illumination" in prompt
+    assert "left" not in prompt.casefold()
+    assert "right" not in prompt.casefold()
+    assert edit in prompt
 
 
 class FakeVisionClient:
@@ -268,14 +304,57 @@ def test_relight_cli_name_rules(monkeypatch, tmp_path: Path) -> None:
 
 def test_relight_response_rejects_invalid_protocol() -> None:
     payload = _decision(True).to_dict()
-    payload["lighting_style"] = "unknown"
-    with pytest.raises(ValueError, match="风格类别无效"):
+    payload["decision"] = "unknown"
+    with pytest.raises(ValueError, match="decision必须是use或skip"):
+        validate_relight_response(payload)
+
+    payload = _decision(True).to_dict()
+    payload["edit_prompt_en"] = ""
+    with pytest.raises(ValueError, match="中英文非空编辑指令"):
         validate_relight_response(payload)
 
     payload = _decision(False).to_dict()
     payload["edit_prompt"] = "must be empty"
     with pytest.raises(ValueError, match="必须为空"):
         validate_relight_response(payload)
+
+
+@pytest.mark.parametrize(
+    ("edit_prompt", "edit_prompt_en"),
+    (
+        ("让高处主光在现有表面形成清晰的新明暗关系。", "Use an elevated key light to create a clear new light-shadow relationship on existing surfaces."),
+        ("改变整体环境照明，使主体与背景获得自然且明显不同的光影层次。", "Change the ambient illumination to give the subject and background a natural, visibly different tonal relationship."),
+        ("仅通过现有场景的照明表现更晚时段的环境氛围，保持所有内容不变。", "Express a later time-of-day atmosphere only through illumination of the existing scene, preserving all content."),
+    ),
+)
+def test_freeform_relighting_schemes_are_accepted(
+    edit_prompt: str, edit_prompt_en: str
+) -> None:
+    """定向光、环境光和时间氛围方案均无需分类字段即可通过。"""
+
+    payload = _decision(True).to_dict()
+    payload["edit_prompt"] = edit_prompt
+    payload["edit_prompt_en"] = edit_prompt_en
+    decision = validate_relight_response(payload)
+    assert decision.decision == "use"
+    assert decision.edit_prompt == edit_prompt
+
+
+def test_legacy_category_fields_are_ignored() -> None:
+    """旧记录中的分类键不再参与决策，也不会重新进入新结果结构。"""
+
+    payload = _decision(True).to_dict()
+    payload.update(
+        lighting_direction="legacy-direction",
+        color_temperature="legacy-temperature",
+        light_quality="legacy-quality",
+        lighting_style="legacy-style",
+    )
+    decision = validate_relight_response(payload)
+    assert set(decision.to_dict()) == {
+        "decision", "scene_summary", "edit_prompt", "edit_prompt_en",
+        "reason", "confidence",
+    }
 
 
 def test_generation_payload_uses_model_specific_schema() -> None:
@@ -437,7 +516,6 @@ def test_resume_pins_recorded_model_and_legacy_defaults_to_gpt(
                 "image_model": "gemini-3.1-flash-image-preview",
                 "resolution": "2k",
                 "image_quality": "high",
-                "prompt_version": "locked-prompt-v1",
                 "vl_model": "locked-vl-model",
             }
         ),
@@ -445,18 +523,16 @@ def test_resume_pins_recorded_model_and_legacy_defaults_to_gpt(
     )
     restored = _load_resume(run_root)
     assert restored[3] == "gemini-3.1-flash-image-preview"
-    assert restored[4:8] == (
-        "2k", "high", "locked-prompt-v1", "locked-vl-model"
-    )
-    assert restored[8] == {"enabled": False}
-    assert restored[9] == "toapis"
+    assert restored[4:7] == ("2k", "high", "locked-vl-model")
+    assert restored[7] == {"enabled": False}
+    assert restored[8] == "toapis"
 
     current = json.loads(config_path.read_text(encoding="utf-8"))
     current["image_provider"] = "moli"
     current["image_model"] = "gpt-image-2"
     current["resolution"] = "2k"
     config_path.write_text(json.dumps(current), encoding="utf-8")
-    assert _load_resume(run_root)[9] == "moli"
+    assert _load_resume(run_root)[8] == "moli"
 
     # 兼容切换前创建、没有 image_model 字段的旧运行。
     legacy = json.loads(config_path.read_text(encoding="utf-8"))
@@ -464,7 +540,7 @@ def test_resume_pins_recorded_model_and_legacy_defaults_to_gpt(
     legacy.pop("image_provider")
     config_path.write_text(json.dumps(legacy), encoding="utf-8")
     assert _load_resume(run_root)[3] == "gpt-image-2"
-    assert _load_resume(run_root)[9] == "toapis"
+    assert _load_resume(run_root)[8] == "toapis"
 
 
 def test_moli_runner_completes_without_upload_or_polling(tmp_path: Path, monkeypatch) -> None:
@@ -589,7 +665,7 @@ def test_target_count_skips_then_fills_and_preserves_source(tmp_path: Path, monk
 
 def test_failure_consumes_count_and_is_not_replaced(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(env, "PROGRESS_ENABLED", False)
-    monkeypatch.setattr(env, "RELIGHT_STAGE_MAX_ATTEMPTS", 1)
+    monkeypatch.setattr(env, "RELIGHT_STAGE_MAX_RETRIES", 0)
     images = _make_input(tmp_path)
     vision = FailFirstVisionClient()
     generation = FakeGenerationClient()
@@ -876,10 +952,10 @@ class SubmitTemporaryUnavailableClient(FakeGenerationClient):
         )
 
 
-def test_temporary_channel_outage_pauses_without_circuit(
+def test_temporary_channel_outage_fails_item_without_pausing_pipeline(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """连续503耗尽单图重试后保留selected状态，等待稍后续跑。"""
+    """零重试模式下单图503直接失败，但不会暂停整条流水线。"""
 
     monkeypatch.setattr(env, "PROGRESS_ENABLED", False)
 
@@ -905,9 +981,10 @@ def test_temporary_channel_outage_pauses_without_circuit(
     row = runner.state.get(item[0])
     asyncio.run(runner.close())
     assert result["circuit_open"] is False
-    assert result["deferred_pending"] is True
-    assert row["stage"] == "selected"
-    assert len(generation.submit_calls) == env.RELIGHT_STAGE_MAX_ATTEMPTS
+    assert result["deferred_pending"] is False
+    assert result["quota_consumed"] == 1
+    assert row["stage"] == "failed"
+    assert len(generation.submit_calls) == 1
 
 
 def test_circuit_preserves_state_and_resume_does_not_repeat_vl_or_upload(
@@ -1070,6 +1147,7 @@ def test_transient_generation_failure_retries_then_succeeds(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setattr(env, "PROGRESS_ENABLED", False)
+    monkeypatch.setattr(env, "RELIGHT_STAGE_MAX_RETRIES", 2)
 
     async def no_delay(_self, _attempts: int) -> None:
         return None
@@ -1103,7 +1181,7 @@ def test_transient_generation_failure_retries_then_succeeds(
     assert len(generation.submit_calls) == 1
 
 
-def test_ambiguous_query_failure_is_deferred_instead_of_terminal(
+def test_ambiguous_query_failure_fails_item_without_resubmitting(
     tmp_path: Path, monkeypatch
 ) -> None:
     """无法确认远端状态时保留业务ID，禁止误判失败后补建付费任务。"""
@@ -1144,11 +1222,11 @@ def test_ambiguous_query_failure_is_deferred_instead_of_terminal(
     result = asyncio.run(runner.run())
     row = runner.state.get(item[0])
     asyncio.run(runner.close())
-    assert result["deferred_pending"] is True
-    assert result["quota_consumed"] == 0
-    assert row["stage"] == "selected"
+    assert result["deferred_pending"] is False
+    assert result["quota_consumed"] == 1
+    assert row["stage"] == "failed"
     assert row["business_id"]
-    assert row["generation_attempts"] == env.RELIGHT_STAGE_MAX_ATTEMPTS - 1
+    assert row["generation_attempts"] == 1
     assert generation.upload_calls == []
     assert generation.submit_calls == []
 
@@ -1182,12 +1260,12 @@ def test_fresh_business_id_skips_broken_missing_task_lookup(
     assert row["submission_started"] == 1
 
 
-def test_pending_remote_timeout_remains_resumable(
+def test_pending_remote_timeout_fails_item_and_pipeline_continues(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setattr(env, "PROGRESS_ENABLED", False)
     images = _make_input(tmp_path)
-    item = discover_images(images)[0]
+    items = discover_images(images)[:2]
     qwen, toapis = _configs()
     generation = WaitErrorGenerationClient(
         [RelightTaskPendingTimeout("still running")]
@@ -1195,21 +1273,25 @@ def test_pending_remote_timeout_remains_resumable(
     runner = RelightRunner(
         images,
         tmp_path / "run",
-        1,
+        None,
         qwen,
         toapis,
-        new_items=[item],
-        vision_client=FakeVisionClient({"a.jpg": _decision(True)}),
+        new_items=items,
+        vision_client=FakeVisionClient(
+            {Path(item[1]).name: _decision(True) for item in items}
+        ),
         generation_client=generation,
     )
     result = asyncio.run(runner.run())
-    row = runner.state.get(item[0])
+    rows = runner.state.rows()
     asyncio.run(runner.close())
-    assert result["deferred_pending"] is True
-    assert result["quota_consumed"] == 0
-    assert row["stage"] == "selected"
-    assert row["generation_attempts"] == 0
-    assert row["task_id"]
+    assert result["deferred_pending"] is False
+    assert result["completed"] == 1
+    assert result["counts"]["failed"] == 1
+    assert result["target_reached"] is True
+    failed = next(row for row in rows if row["stage"] == "failed")
+    assert failed["generation_attempts"] == 1
+    assert failed["task_id"]
 
 
 def test_matching_generated_encoding_preserves_original_bytes(tmp_path: Path) -> None:

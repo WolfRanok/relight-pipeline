@@ -281,5 +281,4 @@ def public_model_config(config: QwenConfig) -> dict[str, str | int]:
         "model": config.model,
         "base_url": config.base_url,
         "preview_max_pixels": env.RELIGHT_VL_PREVIEW_MAX_PIXELS,
-        "prompt_version": env.RELIGHT_PROMPT_VERSION,
     }

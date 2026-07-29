@@ -211,7 +211,8 @@ class MoliGenerationClient:
     async def _download(self, url: str) -> bytes:
         # 生图已完成后只重试同一个临时URL，绝不能因下载失败重新创建付费任务。
         last_status: int | None = None
-        for attempt in range(1, env.RELIGHT_STAGE_MAX_ATTEMPTS + 1):
+        attempt_limit = env.RELIGHT_STAGE_MAX_RETRIES + 1
+        for attempt in range(1, attempt_limit + 1):
             try:
                 async with self.session.get(url) as response:
                     last_status = response.status
@@ -222,7 +223,7 @@ class MoliGenerationClient:
                         break
             except (aiohttp.ClientError, TimeoutError):
                 pass
-            if attempt < env.RELIGHT_STAGE_MAX_ATTEMPTS:
+            if attempt < attempt_limit:
                 await asyncio.sleep(2 ** (attempt - 1))
         raise RelightGenerationError(
             f"茉莉结果下载失败：HTTP {last_status or 'network'}",

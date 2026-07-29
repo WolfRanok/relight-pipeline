@@ -105,7 +105,7 @@ ALLOWED_RATIOS = (
 )
 
 # 远端在途生图任务上限，从提交前占用到任务进入终态。
-RELIGHT_GENERATION_CONCURRENCY = 100
+RELIGHT_GENERATION_CONCURRENCY = 50
 
 # 茉莉是同步长连接渠道；当前分组实测超过2个在途请求会大量返回“上游负载已
 # 饱和”。该上限只影响茉莉，不改变ToAPIs的远端在途并发。
@@ -113,18 +113,19 @@ RELIGHT_MOLI_GENERATION_CONCURRENCY = 2
 
 # 生图前后阶段分别限流，防止某个慢阶段占住其他阶段的全部连接。
 # 这些值均不是批次大小，流水线始终按单图完成一个便补一个。
-RELIGHT_UPLOAD_CONCURRENCY = 100    # 直接模式下同时上传到ToAPIs的源图数量
-RELIGHT_SUBMIT_CONCURRENCY = 100    # 同时创建远端生图任务的请求数量
-RELIGHT_POLL_CONCURRENCY = 100      # 同时查询远端任务状态的HTTP请求数量
-RELIGHT_DOWNLOAD_CONCURRENCY = 100  # 同时下载生成结果的数量
-RELIGHT_ENCODE_CONCURRENCY = 100    # 同时进行结果解码、校验和必要转码的数量
+RELIGHT_UPLOAD_CONCURRENCY = 50     # 直接模式下同时上传到ToAPIs的源图数量
+RELIGHT_SUBMIT_CONCURRENCY = 50     # 同时创建远端生图任务的请求数量
+RELIGHT_POLL_CONCURRENCY = 50       # 同时查询远端任务状态的HTTP请求数量
+RELIGHT_DOWNLOAD_CONCURRENCY = 50   # 同时下载生成结果的数量
+RELIGHT_ENCODE_CONCURRENCY = 50     # 同时进行结果解码、校验和必要转码的数量
 
 # aiohttp生图连接池的全局上限。它独立于业务并发；生图并发设为300时，
 # 最多仍只有120个HTTP请求同时占用网络连接。
 RELIGHT_HTTP_CONNECTION_LIMIT = 120
 
-# VL和生图阶段的技术重试、请求超时与远端轮询窗口。
-RELIGHT_STAGE_MAX_ATTEMPTS = 3
+# VL和生图阶段失败后的额外重试次数。0表示每张图只尝试一次，失败立即释放
+# 并发槽位继续下一张；它不阻止续跑时查询已经持久化的远端付费任务。
+RELIGHT_STAGE_MAX_RETRIES = 0
 # 明确未计费的429限流使用较长退避，避免大量任务同步重试再次压满渠道。
 RELIGHT_RATE_LIMIT_RETRY_SECONDS = 30
 RELIGHT_API_TIMEOUT_SECONDS = 120
@@ -139,7 +140,6 @@ RELIGHT_UPLOAD_MAX_BYTES = 9_500_000
 
 # 仅当生成结果实际编码与源扩展名不一致时才转码并使用该质量。
 RELIGHT_OUTPUT_QUALITY = 95
-RELIGHT_PROMPT_VERSION = "relight-natural-visible-v1"
 
 
 # ---------------------------------------------------------------------------
